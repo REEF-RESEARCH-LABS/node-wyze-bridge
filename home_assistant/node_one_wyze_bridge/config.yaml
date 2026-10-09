@@ -3,7 +3,7 @@ description: >-
   WebRTC/RTSP/HLS bridge for Wyze cameras.
   Stream your Wyze cameras locally without cloud dependencies.
 slug: node_one_wyze_bridge
-url: https://github.com/IDisposable/docker-wyze-bridge
+url: https://github.com/REEF-RESEARCH-LABS/node-wyze-bridge
 version: 4.6.1-node.12
 stage: stable
 arch:
