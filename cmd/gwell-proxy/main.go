@@ -29,6 +29,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -89,7 +90,9 @@ func (tc *tokenCache) isValid() bool {
 // and (c) accumulate bytesIn/bytesOut so the session-end summary can
 // answer "did we get any video at all?" in one log line.
 type writeTracker struct {
-	inner     *stream.FFmpegPublisher
+	pubMu     sync.Mutex
+	pub       publisher      // the ffmpeg publisher; replaced when it dies (swap)
+	params    [][]byte       // the last SPS and PPS seen, start codes included
 	dump      io.WriteCloser // nil when --dump-h264 isn't set
 	lastWrite atomic.Int64   // unix nano
 	bytesIn   atomic.Uint64  // raw bytes received from the P2P pipeline
@@ -140,6 +143,14 @@ func (a *arrivalMeter) note(p []byte) {
 	}
 }
 
+// publisher is what the tracker writes into: an ffmpeg publisher, or a
+// fake in tests.
+type publisher interface {
+	Write([]byte) (int, error)
+	Alive() bool
+	Close() error
+}
+
 func (w *writeTracker) Write(p []byte) (int, error) {
 	if len(p) > 0 {
 		w.bytesIn.Add(uint64(len(p)))
@@ -151,12 +162,80 @@ func (w *writeTracker) Write(p []byte) (int, error) {
 		_, _ = w.dump.Write(p)
 	}
 
-	n, err := w.inner.Write(p)
+	w.pubMu.Lock()
+	w.keepParams(p)
+	n, err := w.pub.Write(p)
+	w.pubMu.Unlock()
 	if n > 0 {
 		w.lastWrite.Store(time.Now().UnixNano())
 		w.bytesOut.Add(uint64(n))
 	}
 	return n, err
+}
+
+// keepParams remembers the stream's latest SPS and PPS, so a new publisher
+// can be primed with them: ffmpeg cannot decode a single frame of an H.264
+// stream it joins mid-way until it has seen both. Caller holds pubMu.
+func (w *writeTracker) keepParams(p []byte) {
+	var sps, pps []byte
+	for _, nal := range annexBUnits(p) {
+		switch nal[len(nal)-len(bytes.TrimLeft(nal, "\x00"))+1] & 0x1f {
+		case 7:
+			sps = nal
+		case 8:
+			pps = nal
+		}
+	}
+	if sps != nil && pps != nil {
+		w.params = [][]byte{append([]byte(nil), sps...), append([]byte(nil), pps...)}
+	}
+}
+
+// annexBUnits splits an Annex B buffer into NAL units, each with its start
+// code. Units cut off by the end of the buffer come back as they are.
+func annexBUnits(p []byte) [][]byte {
+	var starts []int
+	for i := 0; i+3 <= len(p); i++ {
+		if p[i] == 0 && p[i+1] == 0 && p[i+2] == 1 {
+			s := i
+			if s > 0 && p[s-1] == 0 {
+				s--
+			}
+			starts = append(starts, s)
+			i += 2
+		}
+	}
+	units := make([][]byte, 0, len(starts))
+	for k, s := range starts {
+		end := len(p)
+		if k+1 < len(starts) {
+			end = starts[k+1]
+		}
+		if head := len(p[s:end]) - len(bytes.TrimLeft(p[s:end], "\x00")); end-s > head+1 {
+			units = append(units, p[s:end])
+		}
+	}
+	return units
+}
+
+// swap puts a new publisher in place of a dead one, primed with the last
+// SPS and PPS, and returns the old one for the caller to close. The camera
+// session never notices: frames keep flowing into whichever is current.
+func (w *writeTracker) swap(fresh publisher) publisher {
+	w.pubMu.Lock()
+	defer w.pubMu.Unlock()
+	old := w.pub
+	w.pub = fresh
+	for _, unit := range w.params {
+		_, _ = fresh.Write(unit)
+	}
+	return old
+}
+
+func (w *writeTracker) current() publisher {
+	w.pubMu.Lock()
+	defer w.pubMu.Unlock()
+	return w.pub
 }
 
 func (w *writeTracker) lastWriteTime() time.Time {
@@ -432,13 +511,13 @@ func streamCamera(client *wyzeShimClient, cameraID string,
 	if err != nil {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
-	defer ffmpeg.Close()
 
 	// writeTracker feeds bytes straight to ffmpeg, optionally teeing
 	// them to --dump-h264 for offline ffprobe inspection, while
 	// tracking last-write time for the deadman switch and byte counts
 	// for the session-end summary.
-	tracker := &writeTracker{inner: ffmpeg}
+	tracker := &writeTracker{pub: ffmpeg}
+	defer func() { tracker.current().Close() }()
 	if os.Getenv("GWELL_ARRIVAL_LOG") != "" {
 		tracker.meter = &arrivalMeter{camera: cameraID}
 	}
@@ -522,10 +601,20 @@ func streamCamera(client *wyzeShimClient, cameraID string,
 			return nil
 
 		case <-ticker.C:
-			// Check ffmpeg health
-			if !ffmpeg.Alive() {
-				sess.Close()
-				return fmt.Errorf("ffmpeg process died")
+			// Check ffmpeg health. When it dies, the go2rtc it publishes
+			// into restarted or refused it; the camera session is still
+			// fine. A new publisher is started and the session kept: a full
+			// reconnect costs a new P2P handshake, a minute or more on a
+			// Window Cam. A stream that never comes back still ends at the
+			// deadman timeout below.
+			if old := tracker.current(); !old.Alive() {
+				fresh, err := stream.StartFFmpegPublisherFPS(streamPath, rtspHost, rtspPort, ffmpegLogLevel, fps)
+				if err != nil {
+					sess.Close()
+					return fmt.Errorf("ffmpeg died and would not restart: %w", err)
+				}
+				tracker.swap(fresh).Close()
+				log.Printf("[%s] ffmpeg publisher restarted; camera session kept", cameraID)
 			}
 
 			// Deadman switch: no data for too long
