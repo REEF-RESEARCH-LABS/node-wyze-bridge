@@ -2,14 +2,9 @@
 
 set -euo pipefail
 
-# Node One test build: its own web port, so it can run beside the bridge
-# Node One manages (which holds 5080) during the Window Cam test.
-export BRIDGE_PORT="${BRIDGE_PORT:-5081}"
-# Per-second arrival timing for the Window Cam test (one line a second).
-export GWELL_ARRIVAL_LOG=1
-# Window Cam diagnosis knobs, off: set GWELL_DUMP_DIR to tee raw H.264 to
-# disk (about 1 GB an hour per camera) and GWELL_FFMPEG_LOGLEVEL=info for
-# ffmpeg's own words.
+# Diagnosis knobs, off by default: GWELL_DUMP_DIR tees raw H.264 to disk
+# (about 1 GB an hour per camera), GWELL_FFMPEG_LOGLEVEL=info shows
+# ffmpeg's own words, GWELL_ARRIVAL_LOG=1 logs per-second arrival timing.
 
 # HA add-on options (nested under wyze/bridge/camera/snapshot/record/
 # mqtt/filter/location/webhooks/gwell/debug) → flat env vars for the Go
