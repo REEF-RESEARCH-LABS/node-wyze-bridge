@@ -1,5 +1,23 @@
 # Docker Wyze Bridge
 
+> **About this fork.** Reef Research Labs' build of
+> [IDisposable/docker-wyze-bridge](https://github.com/IDisposable/docker-wyze-bridge)
+> (from its `dev` branch), used in Node One. Licensed AGPL-3.0, like
+> upstream. Our changes, all for Gwell cameras with an external go2rtc
+> (tested on a Wyze Window Cam, GW_WC, firmware 1.3.0.63):
+>
+> - External go2rtc mode now starts gwell-proxy. It decided before
+>   discovery, on an empty camera list, so it never ran.
+> - go2rtc stream deletes use `?src=`. With `?name=` they were silent no-ops.
+> - gwell-proxy stamps frames at the camera's own rate (Window Cam 20 fps,
+>   `GWELL_FPS` overrides) instead of the wall clock at 15 fps.
+> - ffmpeg inserts access unit delimiters (`h264_metadata=aud=insert`).
+>   Without them go2rtc's MSE/HLS path merged about 6% of frames, and
+>   browsers froze or showed green until the next keyframe.
+> - Gwell publish slot health: a foreign source on the slot is logged, and
+>   the slot is re-claimed only when no publisher is attached.
+> - `home_assistant/node_one_wyze_bridge`: a local add-on build of the above.
+
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/idisposable/docker-wyze-bridge?logo=github)](https://github.com/idisposable/docker-wyze-bridge/releases/latest)
 [![GHCR Package](https://img.shields.io/badge/ghcr-package-blue?logo=github)](https://ghcr.io/idisposable/docker-wyze-bridge)
 [![Docker](https://github.com/IDisposable/docker-wyze-bridge/actions/workflows/docker-image.yml/badge.svg)](https://github.com/IDisposable/docker-wyze-bridge/actions/workflows/docker-image.yml)
