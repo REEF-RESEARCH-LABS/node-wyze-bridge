@@ -35,3 +35,7 @@ coverage.out
 coverage.html
 
 .devcontainer/devcontainer-lock.json
+
+# Local build outputs (binaries are built, never committed)
+/out/
+/home_assistant/node_one_wyze_bridge/bin/
