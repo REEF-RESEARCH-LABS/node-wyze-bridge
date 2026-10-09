@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -365,6 +366,41 @@ func (m *Manager) HealthCheck(ctx context.Context) {
 		// the exact dance that caused gwell-proxy's ffmpeg to die with
 		// av_interleaved_write_frame(): Broken pipe during bring-up.
 		if cam.GetInfo().IsGwell() {
+			// Node One: the publish slot must exist and carry no other
+			// source. A shared go2rtc can lose the slot on restart, or hold
+			// an old webrtc:/wyze: source for the same name from an earlier
+			// route; either way gwell-proxy's push then lands nowhere or
+			// competes with a dead source. Re-claim the slot (a PUT with no
+			// source replaces the stream) without touching a healthy one.
+			info, ok := streams[cam.Name()]
+			if ok && hasForeignSource(info) {
+				// Say which sources were found (scheme only: a source URL
+				// can carry a camera key).
+				var kinds []string
+				for _, p := range info.Producers {
+					// Scheme, host and path only: queries and fragments can
+					// carry signed tokens.
+					kind := p.URL
+					if i := strings.IndexAny(kind, "?#"); i >= 0 {
+						kind = kind[:i]
+					}
+					if len(kind) > 80 {
+						kind = kind[:80]
+					}
+					kinds = append(kinds, kind)
+				}
+				m.log.Info().Str("cam", cam.Name()).Strs("sources", kinds).Int("producers", len(info.Producers)).Msg("gwell slot holds a foreign source")
+			}
+			// Never while gwell-proxy's push is attached: a PUT replaces the
+			// stream and cuts every viewer off (seen on the box, 2026-10-09:
+			// a re-claim every 30 s froze the picture every 30 s).
+			if !ok || (hasForeignSource(info) && !hasPublisher(info)) {
+				if err := go2rtc.AddStream(ctx, cam.Name(), ""); err != nil {
+					m.log.Warn().Err(err).Str("cam", cam.Name()).Msg("gwell slot re-claim failed")
+				} else {
+					m.log.Info().Str("cam", cam.Name()).Bool("missing", !ok).Msg("gwell slot re-claimed in go2rtc")
+				}
+			}
 			continue
 		}
 
@@ -653,4 +689,34 @@ func (m *Manager) clearChronic(camName string) {
 		return
 	}
 	m.onChronicRecover(camName)
+}
+
+// hasForeignSource reports a source URL on a Gwell publish slot that is
+// not an RTSP publish (gwell-proxy pushes over RTSP): a leftover webrtc:
+// or wyze: source from another route for the same camera name.
+func hasForeignSource(info *go2rtcmgr.StreamInfo) bool {
+	if info == nil {
+		return false
+	}
+	for _, p := range info.Producers {
+		u := strings.ToLower(p.URL)
+		if strings.HasPrefix(u, "webrtc:") || strings.HasPrefix(u, "wyze:") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPublisher reports a producer with no source URL: an incoming RTSP
+// push, which is how gwell-proxy delivers video.
+func hasPublisher(info *go2rtcmgr.StreamInfo) bool {
+	if info == nil {
+		return false
+	}
+	for _, p := range info.Producers {
+		if p.URL == "" {
+			return true
+		}
+	}
+	return false
 }

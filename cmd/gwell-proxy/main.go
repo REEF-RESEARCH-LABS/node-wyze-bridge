@@ -37,6 +37,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,11 +94,58 @@ type writeTracker struct {
 	lastWrite atomic.Int64   // unix nano
 	bytesIn   atomic.Uint64  // raw bytes received from the P2P pipeline
 	bytesOut  atomic.Uint64  // bytes actually forwarded to ffmpeg
+	meter     *arrivalMeter  // per-second timing, when GWELL_ARRIVAL_LOG is set
+}
+
+// Per-second arrival timing (Node One, 2026-10-09): the dump shows the
+// camera's frames are clean, so stalls are about WHEN they arrive. Every
+// second: bytes, writes, Annex B frame starts, and the longest gap between
+// two writes.
+type arrivalMeter struct {
+	mu     sync.Mutex
+	start  time.Time
+	last   time.Time
+	bytes  int
+	writes int
+	frames int
+	maxGap time.Duration
+	camera string
+}
+
+func (a *arrivalMeter) note(p []byte) {
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.start.IsZero() {
+		a.start = now
+	}
+	if !a.last.IsZero() {
+		if gap := now.Sub(a.last); gap > a.maxGap {
+			a.maxGap = gap
+		}
+	}
+	a.last = now
+	a.bytes += len(p)
+	a.writes++
+	for i := 0; i+4 <= len(p); i++ {
+		if p[i] == 0 && p[i+1] == 0 && p[i+2] == 1 {
+			if t := p[i+3] & 0x1f; t == 1 || t == 5 {
+				a.frames++
+			}
+		}
+	}
+	if now.Sub(a.start) >= time.Second {
+		log.Printf("[%s] arrival: %dB %d writes %d frames, longest gap %dms", a.camera, a.bytes, a.writes, a.frames, a.maxGap.Milliseconds())
+		a.start, a.bytes, a.writes, a.frames, a.maxGap = now, 0, 0, 0, 0
+	}
 }
 
 func (w *writeTracker) Write(p []byte) (int, error) {
 	if len(p) > 0 {
 		w.bytesIn.Add(uint64(len(p)))
+		if w.meter != nil {
+			w.meter.note(p)
+		}
 	}
 	if w.dump != nil && len(p) > 0 {
 		_, _ = w.dump.Write(p)
@@ -378,7 +426,9 @@ func streamCamera(client *wyzeShimClient, cameraID string,
 	log.Printf("[%s] Starting stream: %s (LAN IP: %s)", cameraID, streamPath, info.LanIP)
 
 	// Start ffmpeg publisher
-	ffmpeg, err := stream.StartFFmpegPublisher(streamPath, rtspHost, rtspPort, ffmpegLogLevel)
+	fps := gwellFPS(cameraID)
+	log.Printf("[%s] stamping video at %d fps", cameraID, fps)
+	ffmpeg, err := stream.StartFFmpegPublisherFPS(streamPath, rtspHost, rtspPort, ffmpegLogLevel, fps)
 	if err != nil {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
@@ -389,6 +439,9 @@ func streamCamera(client *wyzeShimClient, cameraID string,
 	// tracking last-write time for the deadman switch and byte counts
 	// for the session-end summary.
 	tracker := &writeTracker{inner: ffmpeg}
+	if os.Getenv("GWELL_ARRIVAL_LOG") != "" {
+		tracker.meter = &arrivalMeter{camera: cameraID}
+	}
 	tracker.lastWrite.Store(time.Now().UnixNano())
 	defer tracker.Close()
 	// Session-end summary — one log line tells you whether the session
@@ -511,4 +564,20 @@ func saveCache(tc *tokenCache) {
 		return
 	}
 	log.Printf("[cache] Saved token cache to %s", path)
+}
+
+// gwellFPS is the frame rate a Gwell camera sends, by model (the device ID
+// starts with the model code). GWELL_FPS overrides it for every camera.
+// Window Cam measured at 20 fps (2026-10-09); Doorbell Pro and OG keep
+// upstream's 15.
+func gwellFPS(cameraID string) int {
+	if v, err := strconv.Atoi(os.Getenv("GWELL_FPS")); err == nil && v > 0 && v <= 60 {
+		return v
+	}
+	switch {
+	case strings.HasPrefix(cameraID, "GW_WC"):
+		return 20
+	default:
+		return 15
+	}
 }

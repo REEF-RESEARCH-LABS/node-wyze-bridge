@@ -344,24 +344,16 @@ func startGwellProxyIfEnabled(ctx context.Context, cfg *config.Config, camMgr *c
 		log.Info().Msg("GWELL_ENABLED=false; GW_ cameras will be skipped")
 		return nil
 	}
-	// Only spawn if there's at least one OG-style Gwell camera (IsGwell
+	// Only spawn once there is at least one OG-style Gwell camera (IsGwell
 	// and LAN-reachable). WebRTC-streamer cameras go to go2rtc's native
 	// #format=wyze handler — gwell-proxy would just poll the shim and
 	// log "0 Gwell cameras, retrying in 30s" forever.
-	hasOG := false
-	for _, cam := range camMgr.Cameras() {
-		info := cam.GetInfo()
-		if info.IsGwell() && !info.IsWebRTCStreamer() {
-			hasOG = true
-			break
-		}
-	}
-	if !hasOG {
-		log.Info().Msg("GWELL_ENABLED=true but no OG-style Gwell cameras discovered; skipping gwell-proxy")
-		return nil
-	}
-
-	log.Info().Msg("GWELL_ENABLED=true; spawning gwell-proxy")
+	//
+	// Node One: wait for one instead of deciding once at startup. The
+	// first discovery can fail (Wyze answers 429 when a login follows
+	// another closely) and the next one, a second later, lists the
+	// Window Cam; a one-shot decision skipped gwell-proxy for the whole
+	// run.
 	proxyCtx, proxyCancel := context.WithCancel(ctx)
 	handle := &gwellProxyHandle{
 		cancel: proxyCancel,
@@ -370,9 +362,32 @@ func startGwellProxyIfEnabled(ctx context.Context, cfg *config.Config, camMgr *c
 	gwellLog := log.With().Str("c", "gwell-proxy").Logger()
 	go func() {
 		defer close(handle.done)
+		waiting := false
+		for !hasOGGwellCamera(camMgr) {
+			if !waiting {
+				log.Info().Msg("GWELL_ENABLED=true; waiting for an OG-style Gwell camera before spawning gwell-proxy")
+				waiting = true
+			}
+			select {
+			case <-proxyCtx.Done():
+				return
+			case <-time.After(15 * time.Second):
+			}
+		}
+		log.Info().Msg("GWELL_ENABLED=true; spawning gwell-proxy")
 		spawnGwellProxy(proxyCtx, cfg, gwellLog)
 	}()
 	return handle
+}
+
+func hasOGGwellCamera(camMgr *camera.Manager) bool {
+	for _, cam := range camMgr.Cameras() {
+		info := cam.GetInfo()
+		if info.IsGwell() && !info.IsWebRTCStreamer() {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *gwellProxyHandle) Stop(ctx context.Context) error {
@@ -669,6 +684,18 @@ func setupGo2RTC(ctx context.Context, cfg *config.Config, camMgr *camera.Manager
 		defer probeCancel()
 		if _, err := go2rtcAPI.ListStreams(probeCtx); err != nil {
 			log.Fatal().Err(err).Str("url", cfg.Go2RTCURL).Msg("external go2rtc unreachable")
+		}
+
+		// Node One: discover before returning, as embedded mode does.
+		// startGwellProxyIfEnabled runs right after this and decides from
+		// the camera list; with an empty list it skipped gwell-proxy for
+		// good, so a Window Cam (GW_WC) could never stream in external
+		// mode.
+		log.Info().Msg("running initial Wyze discovery (external go2rtc)")
+		discoverCtx, discoverCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer discoverCancel()
+		if err := camMgr.Discover(discoverCtx); err != nil {
+			log.Warn().Err(err).Msg("initial discovery failed; gwell-proxy decision uses an empty camera list")
 		}
 
 		return go2rtcAPI, nil

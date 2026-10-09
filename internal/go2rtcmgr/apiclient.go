@@ -151,7 +151,10 @@ func (c *APIClient) AddStream(ctx context.Context, name, streamURL string) error
 
 // DeleteStream removes a stream from go2rtc.
 func (c *APIClient) DeleteStream(ctx context.Context, name string) error {
-	u := fmt.Sprintf("%s/api/streams?name=%s", c.baseURL, url.QueryEscape(name))
+	// go2rtc's DELETE /api/streams reads the stream name from "src", not
+	// "name" (internal/streams/api.go, 1.9.x). With "name" every delete was
+	// a silent no-op and stale sources stayed in go2rtc.
+	u := fmt.Sprintf("%s/api/streams?src=%s", c.baseURL, url.QueryEscape(name))
 
 	req, err := http.NewRequestWithContext(ctx, "DELETE", u, nil)
 	if err != nil {

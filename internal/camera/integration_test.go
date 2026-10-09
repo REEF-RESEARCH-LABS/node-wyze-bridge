@@ -37,7 +37,8 @@ func mockGo2RTCServer(t *testing.T) (*httptest.Server, *go2rtcmgr.APIClient) {
 			}
 			w.WriteHeader(200)
 		case r.URL.Path == "/api/streams" && r.Method == "DELETE":
-			name := r.URL.Query().Get("name")
+			// Real go2rtc (internal/streams/api.go) reads "src" on DELETE.
+			name := r.URL.Query().Get("src")
 			delete(streams, name)
 			w.WriteHeader(200)
 		case r.URL.Path == "/api/frame.jpeg":
@@ -67,10 +68,10 @@ func mockWyzeAPIServer(t *testing.T) *httptest.Server {
 						"enr":           "enr1",
 						"firmware_ver":  "4.52.9",
 						"device_params": map[string]interface{}{
-							"p2p_id":   "UID01234567890123456",
-							"p2p_type": float64(4),
-							"ip":       "10.0.0.1",
-							"dtls":     float64(1),
+							"p2p_id":            "UID01234567890123456",
+							"p2p_type":          float64(4),
+							"ip":                "10.0.0.1",
+							"dtls":              float64(1),
 							"camera_thumbnails": map[string]interface{}{},
 						},
 					},
@@ -82,10 +83,10 @@ func mockWyzeAPIServer(t *testing.T) *httptest.Server {
 						"enr":           "enr2",
 						"firmware_ver":  "4.36.14",
 						"device_params": map[string]interface{}{
-							"p2p_id":   "UID01234567890123457",
-							"p2p_type": float64(4),
-							"ip":       "10.0.0.2",
-							"dtls":     float64(1),
+							"p2p_id":            "UID01234567890123457",
+							"p2p_type":          float64(4),
+							"ip":                "10.0.0.2",
+							"dtls":              float64(1),
 							"camera_thumbnails": map[string]interface{}{},
 						},
 					},
