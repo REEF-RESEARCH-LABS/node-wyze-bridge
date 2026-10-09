@@ -38,7 +38,7 @@ func StartFFmpegPublisher(streamPath, rtspHost string, rtspPort int, logLevel st
 // frame rate. The rate is how ffmpeg stamps raw H.264 (it has no
 // timestamps of its own): stamped slower than it arrives, the stream's
 // clock falls behind, players pile up video and jump ahead, and a jump
-// shows black until the next keyframe. Measured 2026-10-09 (Node One): a
+// shows black until the next keyframe. Measured 2026-10-09: a
 // Window Cam (GW_WC, fw 1.3.0.63) sends 1080p at 20 fps with a keyframe
 // every 80 frames; stamped at 15 it played ~5 s, froze, went black.
 func StartFFmpegPublisherFPS(streamPath, rtspHost string, rtspPort int, logLevel string, fps int) (*FFmpegPublisher, error) {
@@ -90,7 +90,7 @@ func StartFFmpegPublisherFPS(streamPath, rtspHost string, rtspPort int, logLevel
 	//   -avoid_negative_ts make_zero rebases the first RTP timestamp
 	//     to 0 rather than a large wallclock-derived value.
 	//
-	// Node One, 2026-10-09: no -use_wallclock_as_timestamps. With it AND a
+	// 2026-10-09: no -use_wallclock_as_timestamps. With it AND a
 	// fixed -r, frames that arrive in bursts got clock stamps that ran
 	// backwards ("Non-monotonic DTS" every few seconds, hidden below),
 	// and players stalled or drew green until the next keyframe. Stamping
@@ -102,7 +102,7 @@ func StartFFmpegPublisherFPS(streamPath, rtspHost string, rtspPort int, logLevel
 		"-f", "h264",
 		"-i", "pipe:0",
 		"-c:v", "copy",
-		// Access unit delimiters (Node One, 2026-10-09): without them
+		// Access unit delimiters (2026-10-09): without them
 		// go2rtc's web-player path (MSE/HLS/MP4) merged ~6% of a Window
 		// Cam's frames into their neighbours (decoder: "Frame num
 		// change", decode_slice_header error), and browsers froze or drew

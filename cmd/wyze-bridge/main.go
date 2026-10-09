@@ -349,7 +349,7 @@ func startGwellProxyIfEnabled(ctx context.Context, cfg *config.Config, camMgr *c
 	// #format=wyze handler — gwell-proxy would just poll the shim and
 	// log "0 Gwell cameras, retrying in 30s" forever.
 	//
-	// Node One: wait for one instead of deciding once at startup. The
+	// External go2rtc: wait for one instead of deciding once at startup. The
 	// first discovery can fail (Wyze answers 429 when a login follows
 	// another closely) and the next one, a second later, lists the
 	// Window Cam; a one-shot decision skipped gwell-proxy for the whole
@@ -686,7 +686,7 @@ func setupGo2RTC(ctx context.Context, cfg *config.Config, camMgr *camera.Manager
 			log.Fatal().Err(err).Str("url", cfg.Go2RTCURL).Msg("external go2rtc unreachable")
 		}
 
-		// Node One: discover before returning, as embedded mode does.
+		// External go2rtc: discover before returning, as embedded mode does.
 		// startGwellProxyIfEnabled runs right after this and decides from
 		// the camera list; with an empty list it skipped gwell-proxy for
 		// good, so a Window Cam (GW_WC) could never stream in external

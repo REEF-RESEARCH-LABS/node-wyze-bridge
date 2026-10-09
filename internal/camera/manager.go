@@ -366,7 +366,7 @@ func (m *Manager) HealthCheck(ctx context.Context) {
 		// the exact dance that caused gwell-proxy's ffmpeg to die with
 		// av_interleaved_write_frame(): Broken pipe during bring-up.
 		if cam.GetInfo().IsGwell() {
-			// Node One: the publish slot must exist and carry no other
+			// External go2rtc: the publish slot must exist and carry no other
 			// source. A shared go2rtc can lose the slot on restart, or hold
 			// an old webrtc:/wyze: source for the same name from an earlier
 			// route; either way gwell-proxy's push then lands nowhere or

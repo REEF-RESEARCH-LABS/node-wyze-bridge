@@ -97,7 +97,7 @@ type writeTracker struct {
 	meter     *arrivalMeter  // per-second timing, when GWELL_ARRIVAL_LOG is set
 }
 
-// Per-second arrival timing (Node One, 2026-10-09): the dump shows the
+// Per-second arrival timing (2026-10-09): the dump shows the
 // camera's frames are clean, so stalls are about WHEN they arrive. Every
 // second: bytes, writes, Annex B frame starts, and the longest gap between
 // two writes.
