@@ -371,7 +371,9 @@ func startGwellProxyIfEnabled(ctx context.Context, cfg *config.Config, camMgr *c
 			select {
 			case <-proxyCtx.Done():
 				return
-			case <-time.After(15 * time.Second):
+			// Discovery lands seconds after sign-in; a 15 s look missed
+			// it by up to 15 s on every start.
+			case <-time.After(2 * time.Second):
 			}
 		}
 		log.Info().Msg("GWELL_ENABLED=true; spawning gwell-proxy")

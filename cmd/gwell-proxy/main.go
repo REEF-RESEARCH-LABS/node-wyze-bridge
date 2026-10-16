@@ -308,19 +308,26 @@ func main() {
 	// treats fatal-exit as a crash and restart-storms. Patient
 	// polling is the right semantics.
 	log.Println("[main] Waiting for Gwell cameras via shim...")
+	// The shim is on loopback and answers at once, so the first looks come
+	// quickly (2 s, doubling to 30 s): a fixed 30 s wait cost a Window Cam
+	// up to half a minute on every start.
 	var cameraIDs []string
+	wait := 2 * time.Second
 	for {
 		ids, err := client.GetCameraList()
 		if err != nil {
-			log.Printf("[main] shim GetCameraList: %v (retrying)", err)
+			log.Printf("[main] shim GetCameraList: %v (retrying in %s)", err, wait)
 		} else if len(ids) == 0 {
-			log.Printf("[main] shim reports 0 Gwell cameras (retrying in 30s)")
+			log.Printf("[main] shim reports 0 Gwell cameras (retrying in %s)", wait)
 		} else {
 			cameraIDs = ids
 			log.Printf("[main] Found %d camera(s): %v", len(ids), ids)
 			break
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(wait)
+		if wait *= 2; wait > 30*time.Second {
+			wait = 30 * time.Second
+		}
 	}
 
 	// Initial discovery
