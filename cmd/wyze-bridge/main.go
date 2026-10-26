@@ -353,7 +353,8 @@ func startGwellProxyIfEnabled(ctx context.Context, cfg *config.Config, camMgr *c
 	// first discovery can fail (Wyze answers 429 when a login follows
 	// another closely) and the next one, a second later, lists the
 	// Window Cam; a one-shot decision skipped gwell-proxy for the whole
-	// run.
+	// run. A failed sign-in is not repeated by that next discovery: the
+	// API client holds it (wyzeapi.passwordLogin).
 	proxyCtx, proxyCancel := context.WithCancel(ctx)
 	handle := &gwellProxyHandle{
 		cancel: proxyCancel,

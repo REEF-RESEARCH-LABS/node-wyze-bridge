@@ -6,6 +6,7 @@ import (
 	cryptoRand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -97,6 +98,12 @@ type Client struct {
 	WyzeURL       string      // base URL for wyze app endpoints (default: DefaultWyzeAPI)
 	CloudURL      string      // base URL for cloud endpoints (default: DefaultCloudAPI)
 	NewWyzeURL    string      // base URL for "v4" app endpoints incl. get_streams (default: DefaultNewWyzeAPI)
+
+	// Password sign-in hold (Node One, 2026-10-26). Guarded by reloginMu.
+	loginRetryAfter time.Duration // how long a failed sign-in holds the next one
+	loginErr        error         // the last failed sign-in, nil after a good one
+	loginHeldUntil  time.Time     // no password sign-in before this
+	loginRefused    bool          // Wyze refused the login itself: none again this run
 }
 
 // SetAuthObserver attaches callbacks for auth lifecycle events.
@@ -118,6 +125,10 @@ func NewClient(creds Credentials, bridgeVersion string, log zerolog.Logger) *Cli
 		WyzeURL:    DefaultWyzeAPI,
 		CloudURL:   DefaultCloudAPI,
 		NewWyzeURL: DefaultNewWyzeAPI,
+		// Under REFRESH_INTERVAL's 30 min default, so a sign-in Wyze
+		// turned away for a passing reason is tried again on the next
+		// discovery refresh, never sooner.
+		loginRetryAfter: DefaultLoginRetryAfter,
 	}
 }
 
@@ -277,23 +288,29 @@ func (c *Client) EnsureAuth() error {
 func (c *Client) ensureAuthLocked() error {
 	if c.auth == nil {
 		c.log.Debug().Msg("no auth state, initiating login")
-		if _, err := c.Login(); err != nil {
-			c.notifyAuthFailure(fmt.Errorf("initial login: %w", err))
+		if err := c.passwordLogin(); err != nil {
+			c.notifyLoginFailure(fmt.Errorf("initial login: %w", err))
 			return err
 		}
 		c.notifyAuthRecover()
 		return nil
 	}
 	if c.NeedsRefresh() {
-		c.log.Debug().Time("expires_at", c.auth.ExpiresAt).Msg("token nearing expiry, refreshing")
-		_, err := c.RefreshToken()
-		if err != nil {
-			c.log.Warn().Err(err).Msg("token refresh failed, re-logging in")
-			c.auth = nil
-			if _, err = c.Login(); err != nil {
-				c.notifyAuthFailure(fmt.Errorf("token refresh + relogin both failed: %w", err))
-				return err
+		// The refresh token first: it costs no password sign-in.
+		if c.auth.RefreshToken != "" {
+			c.log.Debug().Time("expires_at", c.auth.ExpiresAt).Msg("token nearing expiry, refreshing")
+			_, err := c.RefreshToken()
+			if err == nil {
+				c.notifyAuthRecover()
+				return nil
 			}
+			c.log.Warn().Err(err).Msg("token refresh failed, re-logging in")
+		}
+		// Keep the phone id so the next login stays the same device.
+		c.auth = &AuthState{PhoneID: c.auth.PhoneID}
+		if err := c.passwordLogin(); err != nil {
+			c.notifyLoginFailure(fmt.Errorf("token refresh + relogin both failed: %w", err))
+			return err
 		}
 		c.notifyAuthRecover()
 	}
@@ -315,13 +332,92 @@ func (c *Client) forceRelogin(staleToken string) error {
 	}
 	// Keep the phone id so the next login stays the same device.
 	c.auth = &AuthState{PhoneID: phoneID}
-	if _, err := c.Login(); err != nil {
+	if err := c.passwordLogin(); err != nil {
 		c.auth = &AuthState{PhoneID: phoneID, ExpiresAt: time.Now().Add(-time.Hour)}
-		c.notifyAuthFailure(fmt.Errorf("re-login after expired access token: %w", err))
+		c.notifyLoginFailure(fmt.Errorf("re-login after expired access token: %w", err))
 		return err
 	}
 	c.notifyAuthRecover()
 	return nil
+}
+
+// DefaultLoginRetryAfter is how long a failed password sign-in holds
+// the next one.
+const DefaultLoginRetryAfter = 20 * time.Minute
+
+// LoginHeldError is returned instead of signing in again while a failed
+// sign-in holds the next one. Last is that failure.
+type LoginHeldError struct {
+	Last    error
+	Until   time.Time // zero when held until the bridge restarts
+	Refused bool
+}
+
+func (e *LoginHeldError) Error() string {
+	if e.Refused {
+		return fmt.Sprintf("Wyze sign-in not tried again until the bridge restarts (Wyze refused the login: %v)", e.Last)
+	}
+	return fmt.Sprintf("Wyze sign-in not tried again before %s (last try: %v)", e.Until.Format(time.RFC3339), e.Last)
+}
+
+func (e *LoginHeldError) Unwrap() error { return e.Last }
+
+// passwordLogin is the only door to a password sign-in. Caller holds
+// reloginMu.
+//
+// Wyze locks an account after repeated failed sign-ins. On 2026-10-26 a
+// Node One owner was locked out: every start signed in twice, once for
+// the discovery before go2rtc and again for the discovery loop's first
+// pass a moment later, because a failed Login left no auth and the next
+// caller simply tried again. Now a failed sign-in holds every later one
+// for loginRetryAfter, and a refusal of the login itself (wrong
+// password or key, locked account) for the rest of the run. The next
+// start of the bridge tries once.
+func (c *Client) passwordLogin() error {
+	if c.loginErr != nil && (c.loginRefused || time.Now().Before(c.loginHeldUntil)) {
+		held := &LoginHeldError{Last: c.loginErr, Refused: c.loginRefused}
+		if !c.loginRefused {
+			held.Until = c.loginHeldUntil
+		}
+		c.log.Info().Err(c.loginErr).Bool("refused", c.loginRefused).Time("until", held.Until).
+			Msg("not signing in to Wyze again yet; the last sign-in failed")
+		return held
+	}
+	if _, err := c.Login(); err != nil {
+		c.loginErr = err
+		c.loginRefused = isLoginRefused(err)
+		c.loginHeldUntil = time.Now().Add(c.loginRetryAfter)
+		return err
+	}
+	c.loginErr, c.loginRefused, c.loginHeldUntil = nil, false, time.Time{}
+	return nil
+}
+
+// isLoginRefused is true when Wyze turned the login itself away, so the
+// same login can only be refused again (and feed Wyze's lockout).
+// 1000 is what Wyze answers a wrong email, password, Key ID or API Key
+// with ("Invalid credentials, please check username, password, keyid or
+// apikey"), whatever its generic hint says.
+func isLoginRefused(err error) bool {
+	var apiErr *WyzeAPIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.Code {
+	case "1000", "1001", "1003", "3019", "3024":
+		return true
+	}
+	return false
+}
+
+// notifyLoginFailure reports a failed sign-in, but not a held one: the
+// issue already says what Wyze answered, and a hold would hide it.
+func (c *Client) notifyLoginFailure(err error) {
+	var held *LoginHeldError
+	if errors.As(err, &held) {
+		return
+	}
+	c.notifyAuthFailure(err)
 }
 
 func (c *Client) notifyAuthFailure(err error) {
