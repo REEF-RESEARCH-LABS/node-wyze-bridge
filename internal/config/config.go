@@ -76,7 +76,10 @@ type Config struct {
 	// by Wyze's 2025-02 firmware disabling TUTK on newer HL_CAM4
 	// units. Zero disables the auto-fallback (operators fall back to
 	// the manual MODEL_OVERRIDES workaround). See
-	// DOCS/TUTK_WEBRTC_FALLBACK_DESIGN.md.
+	// DOCS/TUTK_WEBRTC_FALLBACK_DESIGN.md. Off by default in the Node
+	// One build: streams there start only while someone watches, so the
+	// stop/start churn counts as failures, and one promotion lasts the
+	// whole run. Node One names the WebRTC models in MODEL_OVERRIDES.
 	TUTKFallbackThreshold int
 
 	// Recording
@@ -198,7 +201,7 @@ func Load() (*Config, error) {
 		Quality:               env("QUALITY", "hd"),
 		Audio:                 envBool("AUDIO", true),
 		OfflineTime:           envInt("OFFLINE_TIME", 30),
-		TUTKFallbackThreshold: envInt("TUTK_FALLBACK_THRESHOLD", 5),
+		TUTKFallbackThreshold: envInt("TUTK_FALLBACK_THRESHOLD", 0),
 
 		// Recording — default under /media/recordings so bare-Docker
 		// users can mount a single host directory at /media and get

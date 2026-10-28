@@ -433,10 +433,26 @@ func (m *Manager) HealthCheck(ctx context.Context) {
 
 // RunDiscoveryLoop runs the discovery + connect + health check loop.
 func (m *Manager) RunDiscoveryLoop(ctx context.Context) {
+	// A discovery that failed on a held Wyze sign-in runs again when
+	// the hold ends, not only on the next refresh: the hold starts at 2
+	// minutes (wyzeapi.DefaultLoginHolds).
+	var retry <-chan time.Time
+	afterHold := func(err error) {
+		retry = nil
+		if err == nil || m.api == nil {
+			return
+		}
+		if st := m.api.LoginStatus(); st.State == "hold" {
+			retry = time.After(time.Until(st.HoldUntil) + time.Second)
+		}
+	}
+
 	// Initial discovery
-	if err := m.Discover(ctx); err != nil {
+	err := m.Discover(ctx)
+	if err != nil {
 		m.log.Error().Err(err).Msg("initial discovery failed")
 	}
+	afterHold(err)
 	m.ConnectAll(ctx)
 
 	refreshTicker := time.NewTicker(m.cfg.RefreshInterval)
@@ -453,9 +469,18 @@ func (m *Manager) RunDiscoveryLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-refreshTicker.C:
-			if err := m.Discover(ctx); err != nil {
+			err := m.Discover(ctx)
+			if err != nil {
 				m.log.Error().Err(err).Msg("discovery refresh failed")
 			}
+			afterHold(err)
+			m.ConnectAll(ctx)
+		case <-retry:
+			err := m.Discover(ctx)
+			if err != nil {
+				m.log.Error().Err(err).Msg("discovery after sign-in hold failed")
+			}
+			afterHold(err)
 			m.ConnectAll(ctx)
 		case <-healthTicker.C:
 			m.HealthCheck(ctx)

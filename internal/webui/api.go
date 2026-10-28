@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/IDisposable/docker-wyze-bridge/internal/wyzeapi"
 )
 
 // handleFavicon serves the embedded icon.png as the tab favicon.
@@ -32,6 +34,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// Surfaces the active issue count so HA can drive a binary
 	// sensor (config OK / problems) off /api/health.
 	body["config_errors"] = s.issues.Count()
+	for k, v := range s.loginFields() {
+		body[k] = v
+	}
 	if issueList := s.issues.List(); len(issueList) > 0 {
 		body["issues"] = issueList
 		body["status"] = "degraded"
@@ -68,6 +73,43 @@ func (s *Server) handleAPIDiscover(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusServiceUnavailable, "discover hook not wired")
 		return
 	}
+	go s.onDiscoverReq(s.rootCtx)
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// loginFields is the Wyze sign-in state for /api/health:
+// login_state "ok" | "hold" (tries again by itself at login_hold_until,
+// unix seconds) | "refused" (wrong details; held until a restart or
+// POST /api/login), and login_error, Wyze's answer to the last failure.
+func (s *Server) loginFields() map[string]interface{} {
+	st := wyzeapi.LoginStatus{State: "ok"}
+	if s.login != nil {
+		st = s.login.LoginStatus()
+	}
+	until := int64(0)
+	if !st.HoldUntil.IsZero() {
+		until = st.HoldUntil.Unix()
+	}
+	return map[string]interface{}{
+		"login_state":      st.State,
+		"login_hold_until": until,
+		"login_error":      st.Error,
+	}
+}
+
+// handleAPILogin clears any sign-in hold and runs a discovery now, which
+// signs in to Wyze if there is no good token (POST only). The answer
+// comes back at once; the outcome shows on /api/health.
+func (s *Server) handleAPILogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	if s.login == nil || s.onDiscoverReq == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "login hook not wired")
+		return
+	}
+	s.login.ClearLoginHold()
 	go s.onDiscoverReq(s.rootCtx)
 	writeJSON(w, map[string]string{"status": "ok"})
 }

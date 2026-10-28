@@ -168,6 +168,7 @@ func main() {
 		Issues:    issueReg,
 		Mars:      apiClient,
 		KVS:       kvsAdapter{api: apiClient},
+		Login:     apiClient,
 		AuthPhoneID: func() string {
 			if a := apiClient.Auth(); a != nil {
 				return a.PhoneID

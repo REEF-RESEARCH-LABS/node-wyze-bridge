@@ -70,6 +70,16 @@ type Server struct {
 	// responses. Optional — nil leaves phone_id empty, which whep_proxy
 	// tolerates.
 	authPhoneID func() string
+	// login reports and clears the Wyze sign-in hold. Optional — nil
+	// leaves the login_* health fields at "ok" and /api/login at 503.
+	login LoginController
+}
+
+// LoginController is the sign-in side of wyzeapi.Client that
+// /api/health and /api/login use.
+type LoginController interface {
+	LoginStatus() wyzeapi.LoginStatus
+	ClearLoginHold()
 }
 
 // RecordingObserver surfaces the bits of recording.Manager the metrics
@@ -126,6 +136,7 @@ type Options struct {
 	Mars        MarsTokenMinter      // optional; nil → CameraToken endpoint returns 503
 	KVS         KVSStreamProvider    // optional; nil → KVS shim returns 503
 	AuthPhoneID func() string        // optional; nil → empty ClientId in KVS payload
+	Login       LoginController      // optional; nil → login_state "ok", /api/login 503
 }
 
 // NewServer constructs a Server from Options. go2rtc, metrics
@@ -144,6 +155,7 @@ func NewServer(opts Options) *Server {
 		mars:        opts.Mars,
 		kvs:         opts.KVS,
 		authPhoneID: opts.AuthPhoneID,
+		login:       opts.Login,
 	}
 	if s.rootCtx == nil {
 		s.rootCtx = context.Background()
@@ -297,6 +309,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/cameras", s.auth.Wrap(s.handleAPICameras))
 	mux.HandleFunc("/api/cameras/", s.auth.Wrap(s.handleAPICameraAction))
 	mux.HandleFunc("/api/discover", s.auth.Wrap(s.handleAPIDiscover))
+	mux.HandleFunc("/api/login", s.auth.Wrap(s.handleAPILogin))
 	mux.HandleFunc("/api/snapshot/", s.auth.Wrap(s.handleSnapshot))
 	mux.HandleFunc("/api/streams", s.auth.Wrap(s.handleStreamsM3U8))
 	mux.HandleFunc("/api/streams/", s.auth.Wrap(s.handleStreamM3U8))

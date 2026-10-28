@@ -312,3 +312,59 @@ func TestHandleShimKVSSignaling_ForceWebRTCPassesGate(t *testing.T) {
 		t.Fatalf("status = %d body=%s; force-promoted camera should reach KVS", w.Code, w.Body.String())
 	}
 }
+
+type fakeLogin struct {
+	st      wyzeapi.LoginStatus
+	cleared atomic.Int32
+}
+
+func (f *fakeLogin) LoginStatus() wyzeapi.LoginStatus { return f.st }
+func (f *fakeLogin) ClearLoginHold()                  { f.cleared.Add(1); f.st = wyzeapi.LoginStatus{State: "ok"} }
+
+func TestHandleHealth_LoginFields(t *testing.T) {
+	srv, _ := testServer(t)
+	read := func() map[string]interface{} {
+		w := httptest.NewRecorder()
+		srv.handleHealth(w, httptest.NewRequest("GET", "/api/health", nil))
+		var body map[string]interface{}
+		_ = json.NewDecoder(w.Body).Decode(&body)
+		return body
+	}
+	if b := read(); b["login_state"] != "ok" || b["login_hold_until"] != float64(0) || b["login_error"] != "" {
+		t.Fatalf("no login wired: %v", b)
+	}
+	until := time.Unix(1900000000, 0)
+	srv.login = &fakeLogin{st: wyzeapi.LoginStatus{State: "hold", HoldUntil: until, Error: "code 3024 locked"}}
+	if b := read(); b["login_state"] != "hold" || b["login_hold_until"] != float64(1900000000) || b["login_error"] != "code 3024 locked" {
+		t.Fatalf("held: %v", b)
+	}
+}
+
+func TestHandleAPILogin_ClearsHoldAndDiscovers(t *testing.T) {
+	srv, _ := testServer(t)
+	w := httptest.NewRecorder()
+	srv.handleAPILogin(w, httptest.NewRequest("POST", "/api/login", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unwired status = %d", w.Code)
+	}
+	fl := &fakeLogin{st: wyzeapi.LoginStatus{State: "refused", Error: "code 1000"}}
+	srv.login = fl
+	var hit atomic.Int32
+	srv.OnDiscoverRequest(func(context.Context) { hit.Add(1) })
+	w = httptest.NewRecorder()
+	srv.handleAPILogin(w, httptest.NewRequest("GET", "/api/login", nil))
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	srv.handleAPILogin(w, httptest.NewRequest("POST", "/api/login", nil))
+	if w.Code != http.StatusOK || fl.cleared.Load() != 1 {
+		t.Fatalf("status=%d cleared=%d", w.Code, fl.cleared.Load())
+	}
+	for i := 0; i < 100 && hit.Load() == 0; i++ {
+		time.Sleep(time.Millisecond)
+	}
+	if hit.Load() == 0 {
+		t.Fatal("discovery did not run")
+	}
+}

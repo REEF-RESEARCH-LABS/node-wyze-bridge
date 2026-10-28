@@ -16,11 +16,16 @@
 >   browsers froze or showed green until the next keyframe.
 > - Gwell publish slot health: a foreign source on the slot is logged, and
 >   the slot is re-claimed only when no publisher is attached.
-> - One Wyze password sign-in per start. A failed sign-in holds the next
->   one for 20 minutes (the 30 minute discovery refresh tries again), and a
->   refused login (wrong password or key, locked account) is not tried
->   again until the bridge restarts. Each start used to sign in twice,
->   which locked an owner's Wyze account.
+> - One Wyze password sign-in per start, and a failed sign-in holds the
+>   next one. Each start used to sign in twice, which locked an owner's
+>   Wyze account.
+> - Sign-in heals itself (4.6.1-node.16). A failed sign-in is tried again
+>   after 2, 5, 10, 20, then every 30 minutes. Only a wrong login (Wyze
+>   code 1000 or 1001) waits for a restart or `POST /api/login`. A token
+>   Wyze rejects mid-call is refreshed before any password sign-in.
+>   `/api/health` adds `login_state`, `login_hold_until`, `login_error`.
+> - TUTK to WebRTC auto-fallback is off by default (`TUTK_FALLBACK_THRESHOLD=0`):
+>   on-demand streams counted their own stops as failures.
 > - `home_assistant/node_one_wyze_bridge`: a local add-on build of the above.
 
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/idisposable/docker-wyze-bridge?logo=github)](https://github.com/idisposable/docker-wyze-bridge/releases/latest)
@@ -152,8 +157,9 @@ connecting with `IOTC_ER_TIMEOUT` even though the Wyze app still
 plays them. The stream is still available via Wyze's WebRTC backend
 (same one the doorbells use).
 
-**4.5+ recovers these cameras automatically.** After
-`TUTK_FALLBACK_THRESHOLD` (default `5`) consecutive TUTK failures the
+**4.5+ can recover these cameras automatically.** After
+`TUTK_FALLBACK_THRESHOLD` (default `0`, off, in the Node One build;
+upstream `5`) consecutive TUTK failures the
 bridge promotes the camera to the WebRTC path for the rest of the
 process lifetime. No config change needed. Watch `/metrics` for the
 `camera/fallback/<name>` issue and the `webrtc (forced)` label on

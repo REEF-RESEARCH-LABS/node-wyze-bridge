@@ -96,9 +96,8 @@ func TestAHeldSignInSaysWhatWyzeAnswered(t *testing.T) {
 	}
 }
 
-// A refused login is never tried again in this run, however long it
-// runs: the next start of the bridge (the owner's Try again, an update, a
-// reboot) tries once.
+// A refused login (wrong details) is never tried again in this run by
+// itself: the next start of the bridge, or ClearLoginHold, tries once.
 func TestARefusedLoginIsNotTriedAgainThisRun(t *testing.T) {
 	c, logins, _ := loginServer(t, refuse)
 	c.GetCameraList()
@@ -115,8 +114,8 @@ func TestTooManyTriesIsTriedAgainOnlyAfterTheHold(t *testing.T) {
 	answer := tooMany
 	c, logins, _ := loginServer(t, func(w http.ResponseWriter) { answer(w) })
 	c.GetCameraList()
-	if c.loginHeldUntil.Before(time.Now().Add(DefaultLoginRetryAfter - time.Minute)) {
-		t.Fatalf("held until %v, want about %v from now", c.loginHeldUntil, DefaultLoginRetryAfter)
+	if c.loginHeldUntil.Before(time.Now().Add(DefaultLoginHolds[0] - time.Minute)) {
+		t.Fatalf("held until %v, want about %v from now", c.loginHeldUntil, DefaultLoginHolds[0])
 	}
 	c.GetCameraList()
 	if n := logins.Load(); n != 1 {
@@ -142,6 +141,82 @@ func TestAnExpiredSavedTokenIsRefreshedNotSignedIn(t *testing.T) {
 	c.SetAuth(&AuthState{AccessToken: "old", RefreshToken: "ref", PhoneID: "ph", ExpiresAt: time.Now().Add(-time.Hour)})
 	if _, err := c.GetCameraList(); err != nil {
 		t.Fatalf("GetCameraList: %v", err)
+	}
+	if logins.Load() != 0 || refreshes.Load() != 1 {
+		t.Fatalf("logins=%d refreshes=%d, want 0 and 1", logins.Load(), refreshes.Load())
+	}
+}
+
+func answerCode(code string) func(http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		json.NewEncoder(w).Encode(map[string]interface{}{"code": code, "msg": "no"})
+	}
+}
+
+// A passing failure is tried again after a hold that grows each time
+// (2, 5, 10, 20, then 30 minutes), never left for good. 3019 and 3024
+// (TOTP, locked account) heal with time, so they are held, not refused.
+func TestPassingFailuresAreHeldLongerEachTime(t *testing.T) {
+	for _, code := range []string{"429", "1003", "3019", "3024"} {
+		t.Run(code, func(t *testing.T) {
+			answer := tooMany
+			if code != "429" {
+				answer = answerCode(code)
+			}
+			c, logins, _ := loginServer(t, answer)
+			want := []time.Duration{2, 5, 10, 20, 30, 30}
+			for i, m := range want {
+				c.GetCameraList()
+				if n := int(logins.Load()); n != i+1 {
+					t.Fatalf("try %d: sign-ins = %d", i, n)
+				}
+				st := c.LoginStatus()
+				left := time.Until(st.HoldUntil)
+				if st.State != "hold" || left < m*time.Minute-time.Minute || left > m*time.Minute {
+					t.Fatalf("try %d: status %+v (hold %v), want hold of %d min", i, st, left, m)
+				}
+				c.GetCameraList() // inside the hold: no sign-in
+				c.loginMu.Lock()
+				c.loginHeldUntil = time.Now().Add(-time.Second)
+				c.loginMu.Unlock()
+			}
+		})
+	}
+}
+
+func TestLoginStatusSaysRefusedAndClearLoginHoldTriesAgain(t *testing.T) {
+	answer := refuse
+	c, logins, _ := loginServer(t, func(w http.ResponseWriter) { answer(w) })
+	c.GetCameraList()
+	st := c.LoginStatus()
+	if st.State != "refused" || !st.HoldUntil.IsZero() || st.Error == "" {
+		t.Fatalf("status = %+v, want refused with Wyze's words", st)
+	}
+	answer = welcome
+	c.ClearLoginHold()
+	if _, err := c.GetCameraList(); err != nil {
+		t.Fatalf("after ClearLoginHold: %v", err)
+	}
+	if logins.Load() != 2 || c.LoginStatus().State != "ok" {
+		t.Fatalf("logins=%d status=%+v", logins.Load(), c.LoginStatus())
+	}
+}
+
+// Wyze rejecting the token mid-call (2001) is mended with the refresh
+// token; the password is not used.
+func TestARejectedTokenIsRefreshedNotSignedIn(t *testing.T) {
+	c, logins, refreshes := loginServer(t, refuse)
+	c.SetAuth(&AuthState{AccessToken: "old", RefreshToken: "ref", PhoneID: "ph", ExpiresAt: time.Now().Add(time.Hour)})
+	first := true
+	resp, err := c.withFreshAuth(func() (map[string]interface{}, error) {
+		if first {
+			first = false
+			return nil, &WyzeAPIError{Code: "2001"}
+		}
+		return map[string]interface{}{"token": c.auth.AccessToken}, nil
+	})
+	if err != nil || resp["token"] != "refreshed" {
+		t.Fatalf("resp=%v err=%v", resp, err)
 	}
 	if logins.Load() != 0 || refreshes.Load() != 1 {
 		t.Fatalf("logins=%d refreshes=%d, want 0 and 1", logins.Load(), refreshes.Load())

@@ -99,11 +99,14 @@ type Client struct {
 	CloudURL      string      // base URL for cloud endpoints (default: DefaultCloudAPI)
 	NewWyzeURL    string      // base URL for "v4" app endpoints incl. get_streams (default: DefaultNewWyzeAPI)
 
-	// Password sign-in hold (Node One, 2026-10-26). Guarded by reloginMu.
-	loginRetryAfter time.Duration // how long a failed sign-in holds the next one
-	loginErr        error         // the last failed sign-in, nil after a good one
-	loginHeldUntil  time.Time     // no password sign-in before this
-	loginRefused    bool          // Wyze refused the login itself: none again this run
+	// Password sign-in hold (Node One, 2026-10-26). Guarded by loginMu,
+	// a lock of its own so /api/health never waits on a sign-in.
+	loginMu        sync.Mutex
+	loginHolds     []time.Duration // the hold after the 1st, 2nd, ... failure in a row
+	loginFails     int             // failed sign-ins in a row
+	loginErr       error           // the last failed sign-in, nil after a good one
+	loginHeldUntil time.Time       // no password sign-in before this
+	loginRefused   bool            // Wyze refused the login itself: none again this run
 }
 
 // SetAuthObserver attaches callbacks for auth lifecycle events.
@@ -125,10 +128,7 @@ func NewClient(creds Credentials, bridgeVersion string, log zerolog.Logger) *Cli
 		WyzeURL:    DefaultWyzeAPI,
 		CloudURL:   DefaultCloudAPI,
 		NewWyzeURL: DefaultNewWyzeAPI,
-		// Under REFRESH_INTERVAL's 30 min default, so a sign-in Wyze
-		// turned away for a passing reason is tried again on the next
-		// discovery refresh, never sooner.
-		loginRetryAfter: DefaultLoginRetryAfter,
+		loginHolds: DefaultLoginHolds,
 	}
 }
 
@@ -317,9 +317,10 @@ func (c *Client) ensureAuthLocked() error {
 	return nil
 }
 
-// forceRelogin drops a token Wyze has rejected and logs in again.
-// staleToken is the access token that just failed. If another caller
-// already replaced it, this returns nil and the caller retries.
+// forceRelogin drops a token Wyze has rejected and gets a new one: the
+// refresh token first (no password sign-in), a password sign-in only if
+// that fails. staleToken is the access token that just failed. If another
+// caller already replaced it, this returns nil and the caller retries.
 func (c *Client) forceRelogin(staleToken string) error {
 	c.reloginMu.Lock()
 	defer c.reloginMu.Unlock()
@@ -329,6 +330,17 @@ func (c *Client) forceRelogin(staleToken string) error {
 	phoneID := ""
 	if c.auth != nil {
 		phoneID = c.auth.PhoneID
+		if c.auth.RefreshToken != "" {
+			_, err := c.RefreshToken()
+			if err == nil && c.auth.AccessToken != "" && c.auth.AccessToken != staleToken {
+				c.notifyAuthRecover()
+				return nil
+			}
+			if err == nil {
+				err = errors.New("refresh gave back no new access token")
+			}
+			c.log.Warn().Err(err).Msg("token refresh failed after Wyze rejected the access token, signing in")
+		}
 	}
 	// Keep the phone id so the next login stays the same device.
 	c.auth = &AuthState{PhoneID: phoneID}
@@ -341,9 +353,12 @@ func (c *Client) forceRelogin(staleToken string) error {
 	return nil
 }
 
-// DefaultLoginRetryAfter is how long a failed password sign-in holds
-// the next one.
-const DefaultLoginRetryAfter = 20 * time.Minute
+// DefaultLoginHolds is how long a failed password sign-in holds the next
+// one: the first failure 2 minutes, then 5, 10, 20, and 30 for every
+// failure after that. A good sign-in starts the count again.
+var DefaultLoginHolds = []time.Duration{
+	2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 30 * time.Minute,
+}
 
 // LoginHeldError is returned instead of signing in again while a failed
 // sign-in holds the next one. Last is that failure.
@@ -369,42 +384,108 @@ func (e *LoginHeldError) Unwrap() error { return e.Last }
 // Node One owner was locked out: every start signed in twice, once for
 // the discovery before go2rtc and again for the discovery loop's first
 // pass a moment later, because a failed Login left no auth and the next
-// caller simply tried again. Now a failed sign-in holds every later one
-// for loginRetryAfter, and a refusal of the login itself (wrong
-// password or key, locked account) for the rest of the run. The next
-// start of the bridge tries once.
+// caller simply tried again. A failed sign-in holds every later one, for
+// longer each time (DefaultLoginHolds), so the bridge heals by itself
+// after a passing Wyze failure without hammering. A wrong login (code
+// 1000 or 1001) is held for the rest of the run, or until
+// ClearLoginHold: the same details can only be refused again.
 func (c *Client) passwordLogin() error {
+	c.loginMu.Lock()
 	if c.loginErr != nil && (c.loginRefused || time.Now().Before(c.loginHeldUntil)) {
 		held := &LoginHeldError{Last: c.loginErr, Refused: c.loginRefused}
 		if !c.loginRefused {
 			held.Until = c.loginHeldUntil
 		}
-		c.log.Info().Err(c.loginErr).Bool("refused", c.loginRefused).Time("until", held.Until).
+		c.loginMu.Unlock()
+		c.log.Info().Err(held.Last).Bool("refused", held.Refused).Time("until", held.Until).
 			Msg("not signing in to Wyze again yet; the last sign-in failed")
 		return held
 	}
-	if _, err := c.Login(); err != nil {
+	c.loginMu.Unlock()
+	_, err := c.Login()
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	if err != nil {
+		c.loginFails++
+		holds := c.loginHolds
+		if len(holds) == 0 {
+			holds = DefaultLoginHolds
+		}
+		hold := holds[len(holds)-1]
+		if c.loginFails <= len(holds) {
+			hold = holds[c.loginFails-1]
+		}
 		c.loginErr = err
 		c.loginRefused = isLoginRefused(err)
-		c.loginHeldUntil = time.Now().Add(c.loginRetryAfter)
+		c.loginHeldUntil = time.Now().Add(hold)
 		return err
 	}
-	c.loginErr, c.loginRefused, c.loginHeldUntil = nil, false, time.Time{}
+	c.loginFails, c.loginErr, c.loginRefused, c.loginHeldUntil = 0, nil, false, time.Time{}
 	return nil
 }
 
-// isLoginRefused is true when Wyze turned the login itself away, so the
-// same login can only be refused again (and feed Wyze's lockout).
-// 1000 is what Wyze answers a wrong email, password, Key ID or API Key
-// with ("Invalid credentials, please check username, password, keyid or
-// apikey"), whatever its generic hint says.
+// ClearLoginHold lets the next caller sign in at once, whatever the last
+// sign-in answered. The failure count stays, so a hold that follows is
+// as long as it would have been.
+func (c *Client) ClearLoginHold() {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	c.loginErr, c.loginRefused, c.loginHeldUntil = nil, false, time.Time{}
+}
+
+// LoginStatus is the sign-in state for /api/health.
+type LoginStatus struct {
+	State     string    // "ok", "hold" (tries again at HoldUntil), "refused" (until restart)
+	HoldUntil time.Time // zero unless State is "hold"
+	Error     string    // Wyze's answer to the last failed sign-in, "" when ok
+}
+
+// LoginStatus reports the sign-in state without waiting on a sign-in.
+func (c *Client) LoginStatus() LoginStatus {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	switch {
+	case c.loginErr == nil:
+		return LoginStatus{State: "ok"}
+	case c.loginRefused:
+		return LoginStatus{State: "refused", Error: shortLoginError(c.loginErr)}
+	default:
+		// "hold" also once the hold has run out but nobody has tried yet.
+		return LoginStatus{State: "hold", HoldUntil: c.loginHeldUntil, Error: shortLoginError(c.loginErr)}
+	}
+}
+
+func shortLoginError(err error) string {
+	var apiErr *WyzeAPIError
+	if errors.As(err, &apiErr) {
+		return strings.TrimSpace("code " + apiErr.Code + " " + apiErr.Message)
+	}
+	msg := err.Error()
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+	return msg
+}
+
+// isLoginRefused is true when Wyze said the login details are wrong, so
+// the same login can only be refused again (and feed Wyze's lockout).
+//   - 1000 is what Wyze answers a wrong email, password, Key ID or API
+//     Key with ("Invalid credentials, please check username, password,
+//     keyid or apikey"), seen on Node One boxes; the upstream hint calling
+//     it a transient cloud error is wrong.
+//   - 1001 is bad credentials.
+//
+// Everything else is held and tried again, for longer each time: 1003 (a
+// request signature Wyze did not accept; a wrong key comes back as
+// 1000), 3019 (the TOTP step: a time-based code), 3024 (a locked
+// account, which unlocks with time), 429 and network failures.
 func isLoginRefused(err error) bool {
 	var apiErr *WyzeAPIError
 	if !errors.As(err, &apiErr) {
 		return false
 	}
 	switch apiErr.Code {
-	case "1000", "1001", "1003", "3019", "3024":
+	case "1000", "1001":
 		return true
 	}
 	return false
