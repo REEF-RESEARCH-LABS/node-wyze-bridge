@@ -24,6 +24,13 @@
 >   code 1000 or 1001) waits for a restart or `POST /api/login`. A token
 >   Wyze rejects mid-call is refreshed before any password sign-in.
 >   `/api/health` adds `login_state`, `login_hold_until`, `login_error`.
+> - Gwell video never holds up the camera (4.6.1-node.17, REE-1054). Frames
+>   reach ffmpeg through a bounded queue: a publisher that stops reading no
+>   longer freezes the session's heartbeats or the deadman. A full queue
+>   drops stale frames and resumes at a keyframe; a write stuck for 10 s
+>   replaces the publisher and keeps the camera session. The deadman
+>   watches camera input. A cached P2P server address ages from its real
+>   discovery, and two sessions in a row with no video look it up afresh.
 > - TUTK to WebRTC auto-fallback is off by default (`TUTK_FALLBACK_THRESHOLD=0`):
 >   on-demand streams counted their own stops as failures.
 > - `home_assistant/node_one_wyze_bridge`: a local add-on build of the above.

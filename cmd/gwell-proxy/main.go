@@ -50,6 +50,14 @@ import (
 )
 
 const (
+	// Sessions in a row with no video before the server address is looked
+	// up afresh (REE-1054).
+	staleAddressAfter = 2
+	// Frames that may wait for the publisher, and how long one write may
+	// take before the publisher is called stuck and replaced (REE-1054).
+	publishQueue = 256
+	publishStuck = 10 * time.Second
+
 	tokenRefreshInterval = 1 * time.Hour
 	cameraStagger        = 15 * time.Second
 	reconnectDelay       = 10 * time.Second
@@ -69,13 +77,18 @@ type tokenCache struct {
 	ServerAddr  string `json:"serverAddr"`
 	CachedAt    int64  `json:"cachedAt"`
 	TTLSeconds  int64  `json:"ttlSeconds"`
+	// When ServerAddr was really discovered (REE-1054, Node One). CachedAt
+	// moves on every token refresh; reusing a cached address never moves
+	// this, so a stale address ages out instead of renewing itself. A file
+	// without it is from before, and its address's age is unknown.
+	DiscoveredAt int64 `json:"discoveredAt,omitempty"`
 }
 
 func (tc *tokenCache) isValid() bool {
-	if tc.AccessID == "" || tc.AccessToken == "" {
+	if tc.AccessID == "" || tc.AccessToken == "" || tc.DiscoveredAt == 0 {
 		return false
 	}
-	elapsed := time.Since(time.Unix(tc.CachedAt, 0))
+	elapsed := time.Since(time.Unix(tc.DiscoveredAt, 0))
 	ttl := time.Duration(tc.TTLSeconds) * time.Second
 	if ttl == 0 {
 		ttl = 7 * 24 * time.Hour
@@ -90,14 +103,76 @@ func (tc *tokenCache) isValid() bool {
 // and (c) accumulate bytesIn/bytesOut so the session-end summary can
 // answer "did we get any video at all?" in one log line.
 type writeTracker struct {
+	// pubMu guards pub and params. It is never held while a publisher
+	// writes (REE-1054: held across a write into an ffmpeg that stopped
+	// reading, it froze the monitor, so neither the publisher check nor
+	// the deadman ever ran).
 	pubMu     sync.Mutex
 	pub       publisher      // the ffmpeg publisher; replaced when it dies (swap)
 	params    [][]byte       // the last SPS and PPS seen, start codes included
 	dump      io.WriteCloser // nil when --dump-h264 isn't set
-	lastWrite atomic.Int64   // unix nano
+	lastWrite atomic.Int64   // unix nano of the last write the publisher took
+	lastIn    atomic.Int64   // unix nano of the last bytes from the camera
 	bytesIn   atomic.Uint64  // raw bytes received from the P2P pipeline
 	bytesOut  atomic.Uint64  // bytes actually forwarded to ffmpeg
+	dropped   atomic.Uint64  // bytes dropped: queue full, or waiting for a keyframe
 	meter     *arrivalMeter  // per-second timing, when GWELL_ARRIVAL_LOG is set
+
+	// The queue (newWriteTracker). nil: Write publishes itself.
+	queue    chan []byte
+	stop     chan struct{}
+	stopOnce sync.Once
+	resync   atomic.Bool  // drop until a keyframe: after an overflow or a new publisher
+	writing  atomic.Int64 // unix nano the write in progress began, 0 when none
+}
+
+// newWriteTracker starts the goroutine that feeds pub from a bounded
+// queue. Write never waits for the publisher: when the queue is full the
+// stale frames are dropped and the stream resumes at the next keyframe.
+func newWriteTracker(pub publisher) *writeTracker {
+	w := &writeTracker{pub: pub, queue: make(chan []byte, publishQueue), stop: make(chan struct{})}
+	go w.drain()
+	return w
+}
+
+func (w *writeTracker) drain() {
+	for {
+		select {
+		case p := <-w.queue:
+			_, _ = w.publish(p)
+		case <-w.stop:
+			return
+		}
+	}
+}
+
+// publish writes p into the current publisher, outside pubMu.
+func (w *writeTracker) publish(p []byte) (int, error) {
+	pub := w.current()
+	w.writing.Store(time.Now().UnixNano())
+	n, err := pub.Write(p)
+	w.writing.Store(0)
+	if n > 0 {
+		w.lastWrite.Store(time.Now().UnixNano())
+		w.bytesOut.Add(uint64(n))
+	}
+	return n, err
+}
+
+// stuck: one write has been in the publisher for publishStuck.
+func (w *writeTracker) stuck() bool {
+	t := w.writing.Load()
+	return t != 0 && time.Since(time.Unix(0, t)) > publishStuck
+}
+
+// keyframe: p holds an IDR picture or an SPS, where a decoder can start.
+func keyframe(p []byte) bool {
+	for _, nal := range annexBUnits(p) {
+		if t := nal[len(nal)-len(bytes.TrimLeft(nal, "\x00"))+1] & 0x1f; t == 5 || t == 7 {
+			return true
+		}
+	}
+	return false
 }
 
 // Per-second arrival timing (2026-10-09): the dump shows the
@@ -162,15 +237,41 @@ func (w *writeTracker) Write(p []byte) (int, error) {
 		_, _ = w.dump.Write(p)
 	}
 
+	if len(p) > 0 {
+		w.lastIn.Store(time.Now().UnixNano())
+	}
+
 	w.pubMu.Lock()
 	w.keepParams(p)
-	n, err := w.pub.Write(p)
 	w.pubMu.Unlock()
-	if n > 0 {
-		w.lastWrite.Store(time.Now().UnixNano())
-		w.bytesOut.Add(uint64(n))
+	if w.queue == nil {
+		return w.publish(p)
 	}
-	return n, err
+	if w.resync.Load() {
+		if !keyframe(p) {
+			w.dropped.Add(uint64(len(p)))
+			return len(p), nil
+		}
+		w.resync.Store(false)
+	}
+	select {
+	case w.queue <- append([]byte(nil), p...):
+	default:
+		// The publisher is behind: what waits is stale. Drop it and this
+		// frame, and start again at the next keyframe.
+		w.dropped.Add(uint64(len(p)))
+		for {
+			select {
+			case old := <-w.queue:
+				w.dropped.Add(uint64(len(old)))
+				continue
+			default:
+			}
+			break
+		}
+		w.resync.Store(true)
+	}
+	return len(p), nil
 }
 
 // keepParams remembers the stream's latest SPS and PPS, so a new publisher
@@ -229,6 +330,18 @@ func (w *writeTracker) swap(fresh publisher) publisher {
 	for _, unit := range w.params {
 		_, _ = fresh.Write(unit)
 	}
+	if w.queue != nil {
+		// What waited for the old publisher is stale: the new one starts
+		// at a keyframe.
+		for len(w.queue) > 0 {
+			select {
+			case p := <-w.queue:
+				w.dropped.Add(uint64(len(p)))
+			default:
+			}
+		}
+		w.resync.Store(true)
+	}
 	return old
 }
 
@@ -236,6 +349,14 @@ func (w *writeTracker) current() publisher {
 	w.pubMu.Lock()
 	defer w.pubMu.Unlock()
 	return w.pub
+}
+
+func (w *writeTracker) lastInTime() time.Time {
+	ns := w.lastIn.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 func (w *writeTracker) lastWriteTime() time.Time {
@@ -249,6 +370,9 @@ func (w *writeTracker) lastWriteTime() time.Time {
 // Close releases the dump file if one was open. Called from the caller
 // when the session tears down. Safe to call repeatedly.
 func (w *writeTracker) Close() error {
+	if w.stop != nil {
+		w.stopOnce.Do(func() { close(w.stop) })
+	}
 	if w.dump != nil {
 		err := w.dump.Close()
 		w.dump = nil
@@ -398,8 +522,10 @@ func refreshDiscovery(client *wyzeShimClient, anyCameraID string, forceDiscover 
 
 	// Try cache first unless caller explicitly requests a fresh discovery.
 	cache := loadCache()
+	discoveredAt := time.Now().Unix()
 	if !forceDiscover && cache != nil && cache.isValid() && cache.ServerAddr != "" {
 		log.Println("[main] Using cached P2P server address:", cache.ServerAddr)
+		discoveredAt = cache.DiscoveredAt
 		sharedMu.Lock()
 		sharedToken = token
 		sharedServer = cache.ServerAddr
@@ -424,11 +550,12 @@ func refreshDiscovery(client *wyzeShimClient, anyCameraID string, forceDiscover 
 	}
 
 	saveCache(&tokenCache{
-		AccessID:    cred.AccessID,
-		AccessToken: cred.AccessToken,
-		ServerAddr:  sharedServer,
-		CachedAt:    time.Now().Unix(),
-		TTLSeconds:  int64((7 * 24 * time.Hour).Seconds()),
+		AccessID:     cred.AccessID,
+		AccessToken:  cred.AccessToken,
+		ServerAddr:   sharedServer,
+		CachedAt:     time.Now().Unix(),
+		TTLSeconds:   int64((7 * 24 * time.Hour).Seconds()),
+		DiscoveredAt: discoveredAt,
 	})
 
 	return nil
@@ -445,6 +572,7 @@ func getSharedState() (*gwell.AccessToken, string, []gwell.DeviceInfo) {
 func runCamera(client *wyzeShimClient, cameraID string,
 	rtspHost string, rtspPort int, dumpDir string, ffmpegLogLevel string, deadmanTimeout time.Duration, stopCh chan struct{}) {
 
+	failed := 0
 	for {
 		select {
 		case <-stopCh:
@@ -468,11 +596,25 @@ func runCamera(client *wyzeShimClient, cameraID string,
 			}
 		}
 
-		err = streamCamera(client, cameraID, rtspHost, rtspPort, dumpDir, ffmpegLogLevel, deadmanTimeout, stopCh)
+		gotVideo, err := streamCamera(client, cameraID, rtspHost, rtspPort, dumpDir, ffmpegLogLevel, deadmanTimeout, stopCh)
+		if gotVideo {
+			failed = 0
+		}
 		if err != nil {
 			log.Printf("[%s] Stream error: %v", cameraID, err)
 			log.Printf("[%s] reconnect reason: stream_error", cameraID)
-			if derr := refreshDiscovery(client, cameraID, false); derr != nil {
+			// Sessions in a row that brought no video: the cached server
+			// address may be why, so the next look is a real discovery
+			// (REE-1054). A unicast ask of the cloud's list servers, never
+			// a LAN broadcast.
+			if !gotVideo {
+				failed++
+			}
+			force := failed >= staleAddressAfter
+			if force {
+				failed = 0
+			}
+			if derr := refreshDiscovery(client, cameraID, force); derr != nil {
 				log.Printf("[%s] Re-discovery before reconnect failed: %v", cameraID, derr)
 			}
 		}
@@ -489,12 +631,12 @@ func runCamera(client *wyzeShimClient, cameraID string,
 // streamCamera runs a single streaming session for one camera.
 // It acquires connectMu to serialize the P2P handshake phase.
 func streamCamera(client *wyzeShimClient, cameraID string,
-	rtspHost string, rtspPort int, dumpDir string, ffmpegLogLevel string, deadmanTimeout time.Duration, stopCh chan struct{}) error {
+	rtspHost string, rtspPort int, dumpDir string, ffmpegLogLevel string, deadmanTimeout time.Duration, stopCh chan struct{}) (gotVideo bool, err error) {
 
 	// Get device info for stream name and LAN IP
 	info, err := client.GetDeviceInfo(cameraID)
 	if err != nil {
-		return fmt.Errorf("get device info: %w", err)
+		return false, fmt.Errorf("get device info: %w", err)
 	}
 
 	streamName := info.StreamName
@@ -516,26 +658,31 @@ func streamCamera(client *wyzeShimClient, cameraID string,
 	log.Printf("[%s] stamping video at %d fps", cameraID, fps)
 	ffmpeg, err := stream.StartFFmpegPublisherFPS(streamPath, rtspHost, rtspPort, ffmpegLogLevel, fps)
 	if err != nil {
-		return fmt.Errorf("start ffmpeg: %w", err)
+		return false, fmt.Errorf("start ffmpeg: %w", err)
 	}
 
 	// writeTracker feeds bytes straight to ffmpeg, optionally teeing
 	// them to --dump-h264 for offline ffprobe inspection, while
 	// tracking last-write time for the deadman switch and byte counts
 	// for the session-end summary.
-	tracker := &writeTracker{pub: ffmpeg}
+	// Frames reach the publisher through a queue its own goroutine drains:
+	// a publisher that stops reading never holds up the camera session's
+	// loop (its heartbeats) or the monitor below (REE-1054).
+	tracker := newWriteTracker(ffmpeg)
 	defer func() { tracker.current().Close() }()
+	defer func() { gotVideo = tracker.bytesIn.Load() > 0 }()
 	if os.Getenv("GWELL_ARRIVAL_LOG") != "" {
 		tracker.meter = &arrivalMeter{camera: cameraID}
 	}
 	tracker.lastWrite.Store(time.Now().UnixNano())
+	tracker.lastIn.Store(time.Now().UnixNano())
 	defer tracker.Close()
 	// Session-end summary — one log line tells you whether the session
 	// produced any video without having to `stat` the dump file.
 	defer func() {
 		in := tracker.bytesIn.Load()
 		out := tracker.bytesOut.Load()
-		log.Printf("[%s] session end: bytesIn=%d bytesOut=%d (delta=%d)", cameraID, in, out, int64(in)-int64(out))
+		log.Printf("[%s] session end: bytesIn=%d bytesOut=%d (delta=%d) dropped=%d", cameraID, in, out, int64(in)-int64(out), tracker.dropped.Load())
 	}()
 
 	// Optional raw-H.264 dump for offline ffprobe inspection. One file
@@ -601,11 +748,11 @@ func streamCamera(client *wyzeShimClient, cameraID string,
 	for {
 		select {
 		case err := <-errCh:
-			return fmt.Errorf("session ended: %w", err)
+			return false, fmt.Errorf("session ended: %w", err)
 
 		case <-stopCh:
 			sess.Close()
-			return nil
+			return false, nil
 
 		case <-ticker.C:
 			// Check ffmpeg health. When it dies, the go2rtc it publishes
@@ -614,21 +761,30 @@ func streamCamera(client *wyzeShimClient, cameraID string,
 			// reconnect costs a new P2P handshake, a minute or more on a
 			// Window Cam. A stream that never comes back still ends at the
 			// deadman timeout below.
-			if old := tracker.current(); !old.Alive() {
+			// A publisher stuck in one write for publishStuck is replaced
+			// the same way (REE-1054); closing it ends the stuck write.
+			old := tracker.current()
+			if stuck := tracker.stuck(); !old.Alive() || stuck {
 				fresh, err := stream.StartFFmpegPublisherFPS(streamPath, rtspHost, rtspPort, ffmpegLogLevel, fps)
 				if err != nil {
 					sess.Close()
-					return fmt.Errorf("ffmpeg died and would not restart: %w", err)
+					return false, fmt.Errorf("ffmpeg died and would not restart: %w", err)
 				}
 				tracker.swap(fresh).Close()
-				log.Printf("[%s] ffmpeg publisher restarted; camera session kept", cameraID)
+				if stuck {
+					log.Printf("[%s] ffmpeg publisher stopped reading for %s; replaced, camera session kept", cameraID, publishStuck)
+				} else {
+					log.Printf("[%s] ffmpeg publisher restarted; camera session kept", cameraID)
+				}
 			}
 
-			// Deadman switch: no data for too long
-			last := tracker.lastWriteTime()
+			// Deadman switch: no data from the camera for too long. It
+			// watches what the camera sends, never what the publisher took:
+			// a stuck publisher is the case above, not a dead camera.
+			last := tracker.lastInTime()
 			if !last.IsZero() && time.Since(last) > deadmanTimeout {
 				sess.Close()
-				return fmt.Errorf("deadman timeout: no stream data for %s", deadmanTimeout)
+				return false, fmt.Errorf("deadman timeout: no stream data for %s", deadmanTimeout)
 			}
 		}
 	}
