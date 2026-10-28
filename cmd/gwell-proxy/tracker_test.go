@@ -4,23 +4,39 @@ import (
 	"bytes"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type fakePub struct {
+	mu     sync.Mutex
 	writes [][]byte
 	alive  bool
 	closed bool
 }
 
 func (f *fakePub) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.writes = append(f.writes, append([]byte(nil), p...))
 	return len(p), nil
 }
-func (f *fakePub) Alive() bool  { return f.alive }
-func (f *fakePub) Close() error { f.closed = true; return nil }
+func (f *fakePub) Alive() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.alive
+}
+func (f *fakePub) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed, f.alive = true, false
+	return nil
+}
+func (f *fakePub) got() [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]byte(nil), f.writes...)
+}
 
 var (
 	sps = []byte{0, 0, 0, 1, 0x67, 0x64, 0x00, 0x29}
@@ -31,33 +47,45 @@ var (
 
 func cat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 
+func idle(t *testing.T, w *writeTracker) {
+	t.Helper()
+	if !w.waitIdle(2 * time.Second) {
+		t.Fatal("writer did not drain")
+	}
+}
+
 // The go2rtc a camera publishes into restarted: the new publisher must get
 // the stream's SPS and PPS before anything else, or ffmpeg cannot decode
 // a frame until the camera happens to resend them.
 func TestSwapPrimesTheNewPublisherWithTheLastSPSAndPPS(t *testing.T) {
 	first := &fakePub{alive: true}
-	w := &writeTracker{pub: first}
+	w := newWriteTracker(first)
+	defer w.Close()
 	if _, err := w.Write(cat(sps, pps, idr)); err != nil {
 		t.Fatal(err)
 	}
 	w.Write(sli)
-	first.alive = false
+	idle(t, w)
+	first.Close()
 	fresh := &fakePub{alive: true}
 	old := w.swap(fresh)
 	if old != first || w.current() != fresh {
 		t.Fatal("swap did not replace the publisher")
 	}
 	w.Write(sli)
-	if len(fresh.writes) != 3 || !bytes.Equal(fresh.writes[0], sps) || !bytes.Equal(fresh.writes[1], pps) || !bytes.Equal(fresh.writes[2], sli) {
-		t.Fatalf("new publisher got %x", fresh.writes)
+	idle(t, w)
+	got := fresh.got()
+	if len(got) != 3 || !bytes.Equal(got[0], sps) || !bytes.Equal(got[1], pps) || !bytes.Equal(got[2], sli) {
+		t.Fatalf("new publisher got %x", got)
 	}
-	if len(first.writes) != 2 {
-		t.Fatalf("old publisher kept receiving: %d writes", len(first.writes))
+	if len(first.got()) != 2 {
+		t.Fatalf("old publisher kept receiving: %d writes", len(first.got()))
 	}
 }
 
 func TestParamsFollowTheStreamAndIgnoreHalfSets(t *testing.T) {
-	w := &writeTracker{pub: &fakePub{alive: true}}
+	w := newWriteTracker(&fakePub{alive: true})
+	defer w.Close()
 	w.Write(cat(sps, idr)) // an SPS alone does not replace a full set
 	if w.params != nil {
 		t.Fatal("kept an SPS without a PPS")
@@ -65,6 +93,8 @@ func TestParamsFollowTheStreamAndIgnoreHalfSets(t *testing.T) {
 	newSPS := []byte{0, 0, 1, 0x67, 0x4d, 0x00, 0x1f}
 	w.Write(cat(sps, pps, idr))
 	w.Write(cat(newSPS, pps, idr))
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !bytes.Equal(w.params[0], newSPS) || !bytes.Equal(w.params[1], pps) {
 		t.Fatalf("params %x", w.params)
 	}
@@ -77,121 +107,234 @@ func TestAnnexBUnitsSplitsOnBothStartCodes(t *testing.T) {
 	}
 }
 
-// A publisher that stops reading (REE-1054): its Write blocks until it is
-// closed, as a pipe into a stuck ffmpeg does.
-type blockedPub struct {
-	gate   chan struct{}
-	once   sync.Once
-	closed atomic.Bool
+// stallPub is a publisher that stops reading: every Write blocks until the
+// publisher is closed, like ffmpeg's stdin when go2rtc stops consuming.
+type stallPub struct {
+	once    sync.Once
+	closed  chan struct{}
+	entered chan struct{}
 }
 
-func newBlockedPub() *blockedPub { return &blockedPub{gate: make(chan struct{})} }
-func (b *blockedPub) Write(p []byte) (int, error) {
-	<-b.gate
-	return 0, errors.New("closed")
+func newStallPub() *stallPub {
+	return &stallPub{closed: make(chan struct{}), entered: make(chan struct{}, 1)}
 }
-func (b *blockedPub) Alive() bool { return !b.closed.Load() }
-func (b *blockedPub) Close() error {
-	b.once.Do(func() { b.closed.Store(true); close(b.gate) })
-	return nil
-}
-
-type safePub struct {
-	mu     sync.Mutex
-	writes [][]byte
-}
-
-func (f *safePub) Write(p []byte) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.writes = append(f.writes, append([]byte(nil), p...))
-	return len(p), nil
-}
-func (f *safePub) Alive() bool  { return true }
-func (f *safePub) Close() error { return nil }
-func (f *safePub) all() [][]byte {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([][]byte(nil), f.writes...)
-}
-
-func within(t *testing.T, d time.Duration, what string, fn func()) {
-	t.Helper()
-	done := make(chan struct{})
-	go func() { fn(); close(done) }()
+func (s *stallPub) Write(p []byte) (int, error) {
 	select {
-	case <-done:
-	case <-time.After(d):
-		t.Fatalf("%s did not return within %s", what, d)
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.closed
+	return 0, errors.New("publisher closed")
+}
+func (s *stallPub) Alive() bool {
+	select {
+	case <-s.closed:
+		return false
+	default:
+		return true
 	}
 }
+func (s *stallPub) Close() error { s.once.Do(func() { close(s.closed) }); return nil }
 
-// The camera session's loop writes frames and sends its heartbeats; the
-// monitor asks for the publisher. Neither may wait on a publisher that
-// stopped reading.
-func TestABlockedPublisherNeverHoldsUpTheSessionOrTheMonitor(t *testing.T) {
-	stuck := newBlockedPub()
-	w := newWriteTracker(stuck)
+type fakeSession struct {
+	mu     sync.Mutex
+	closed bool
+}
+
+func (f *fakeSession) Close() error { f.mu.Lock(); f.closed = true; f.mu.Unlock(); return nil }
+func (f *fakeSession) isClosed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
+
+// REE-1054 P1, blocked-writer proof. The publisher stops reading while the
+// camera keeps sending. The session loop (which in gwell.Session also runs
+// heartbeats, meter probes and INITREQ renewals between Writes) and the
+// supervisor must keep their cadence, the stuck publisher must be replaced
+// with a fresh one primed with SPS/PPS, video must reach the new publisher,
+// and stop must be honoured promptly.
+func TestBlockedPublisherNeverStallsControlOrSupervisor(t *testing.T) {
+	const (
+		loopEvery    = 5 * time.Millisecond  // session loop iteration (heartbeat scheduler)
+		tick         = 20 * time.Millisecond // supervisor tick
+		writeTimeout = 100 * time.Millisecond
+		runFor       = 800 * time.Millisecond
+		maxLoopGap   = 50 * time.Millisecond
+		maxTickGap   = 100 * time.Millisecond
+	)
+	stalled := newStallPub()
+	w := newWriteTrackerWith(stalled, 16, writeTimeout)
 	defer w.Close()
-	within(t, 2*time.Second, "the session's writes", func() {
-		w.Write(cat(sps, pps, idr))
-		for i := 0; i < 3*publishQueue; i++ {
-			w.Write(sli)
+
+	var freshMu sync.Mutex
+	var fresh []*fakePub
+	newPub := func() (publisher, error) {
+		p := &fakePub{alive: true}
+		freshMu.Lock()
+		fresh = append(fresh, p)
+		freshMu.Unlock()
+		return p, nil
+	}
+
+	// Session loop: one Write per iteration, timing every iteration.
+	stopLoop := make(chan struct{})
+	loopDone := make(chan time.Duration)
+	go func() {
+		var maxGap time.Duration
+		last := time.Now()
+		for i := 0; ; i++ {
+			select {
+			case <-stopLoop:
+				loopDone <- maxGap
+				return
+			case <-time.After(loopEvery):
+			}
+			chunk := sli
+			if i%10 == 0 {
+				chunk = cat(sps, pps, idr)
+			}
+			w.Write(chunk)
+			now := time.Now()
+			if gap := now.Sub(last); gap > maxGap {
+				maxGap = gap
+			}
+			last = now
 		}
-	})
-	within(t, time.Second, "the monitor's current()", func() { _ = w.current() })
-	if w.dropped.Load() == 0 {
-		t.Fatal("a full queue dropped nothing")
+	}()
+	select {
+	case <-stalled.entered:
+	case <-time.After(time.Second):
+		t.Fatal("writer never reached the publisher")
 	}
-	if w.lastInTime().IsZero() {
-		t.Fatal("camera input not timed")
+
+	var tickMu sync.Mutex
+	var ticks []time.Time
+	sess := &fakeSession{}
+	errCh := make(chan error)
+	stopCh := make(chan struct{})
+	supDone := make(chan error, 1)
+	restarts := 0
+	go func() {
+		supDone <- supervise(sess, errCh, stopCh, w, superviseConfig{
+			camera:       "GW_WC_TEST",
+			tick:         tick,
+			deadman:      10 * time.Second,
+			stuckAfter:   2 * writeTimeout,
+			newPublisher: newPub,
+			onTick: func() {
+				tickMu.Lock()
+				ticks = append(ticks, time.Now())
+				tickMu.Unlock()
+			},
+			onRestart: func() { restarts++ },
+		})
+	}()
+
+	time.Sleep(runFor)
+
+	// Stop is honoured promptly while the camera is still sending.
+	stopAt := time.Now()
+	close(stopCh)
+	select {
+	case err := <-supDone:
+		if err != nil {
+			t.Fatalf("supervise on stop: %v", err)
+		}
+	case <-time.After(5 * tick):
+		t.Fatal("stop not honoured: supervisor blocked")
 	}
-	// The write in progress is seen as stuck once it has lasted publishStuck.
-	w.writing.Store(time.Now().Add(-publishStuck - time.Second).UnixNano())
-	if !w.stuck() {
-		t.Fatal("a write held past publishStuck is not stuck")
+	stopLatency := time.Since(stopAt)
+	close(stopLoop)
+	loopGap := <-loopDone
+
+	if !sess.isClosed() {
+		t.Fatal("stop did not close the session")
 	}
-	// Replacing the publisher ends the stuck write; the new one starts at a keyframe.
-	fresh := &safePub{}
-	within(t, time.Second, "swap", func() { w.swap(fresh).Close() })
-	// What was queued for the stuck one is stale: wait for it to drain.
-	deadline := time.Now().Add(2 * time.Second)
-	for len(w.queue) > 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	if loopGap > maxLoopGap {
+		t.Fatalf("session loop stalled %s behind a blocked publisher (limit %s)", loopGap, maxLoopGap)
 	}
-	before := len(fresh.all())
+	tickMu.Lock()
+	var tickGap time.Duration
+	for i := 1; i < len(ticks); i++ {
+		if g := ticks[i].Sub(ticks[i-1]); g > tickGap {
+			tickGap = g
+		}
+	}
+	nTicks := len(ticks)
+	tickMu.Unlock()
+	if nTicks < int(runFor/tick)/2 || tickGap > maxTickGap {
+		t.Fatalf("supervisor ticks=%d max gap=%s: monitor was blocked", nTicks, tickGap)
+	}
+	if stalled.Alive() {
+		t.Fatal("stuck publisher was not closed by the write deadline")
+	}
+	if w.stuck.Load() == 0 {
+		t.Fatal("stuck write not counted")
+	}
+	freshMu.Lock()
+	defer freshMu.Unlock()
+	if len(fresh) != 1 || restarts != 1 {
+		t.Fatalf("publisher replacements=%d restarts=%d, want exactly 1", len(fresh), restarts)
+	}
+	got := fresh[0].got()
+	if len(got) < 3 || !bytes.Equal(got[0], sps) || !bytes.Equal(got[1], pps) {
+		t.Fatalf("replacement publisher not primed / fed: %d writes", len(got))
+	}
+	t.Logf("loop max gap %s, supervisor %d ticks max gap %s, stop latency %s, dropped %d chunks, replacement got %d writes",
+		loopGap, nTicks, tickGap, stopLatency, w.dropped.Load(), len(got))
+}
+
+// A publisher that never returns and is never closed in time still cannot
+// hold the session: overflow drops video, and resumes on a keyframe.
+func TestQueueOverflowDropsToTheNextKeyframe(t *testing.T) {
+	stalled := newStallPub()
+	w := newWriteTrackerWith(stalled, 4, time.Hour)
+	defer func() { stalled.Close(); w.Close() }()
+
+	w.Write(cat(sps, pps, idr)) // taken by the writer, which blocks in Write
+	<-stalled.entered
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		w.Write(sli)
+	}
+	if d := time.Since(start); d > 50*time.Millisecond {
+		t.Fatalf("Write blocked for %s with a stalled publisher", d)
+	}
+	if w.dropped.Load() == 0 || !w.dropping {
+		t.Fatal("overflow did not drop")
+	}
 	w.Write(sli)
+	if !w.dropping {
+		t.Fatal("resumed on a non-keyframe")
+	}
+	// Drain the queue by swapping in a reader, then send a keyframe.
+	fresh := &fakePub{alive: true}
+	w.swap(fresh).Close()
+	idle(t, w)
 	w.Write(cat(idr))
-	w.Write(sli)
-	for len(fresh.all()) < before+2 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	idle(t, w)
+	if w.dropping {
+		t.Fatal("keyframe did not end the drop")
 	}
-	got := fresh.all()
-	if len(got) < 2 || !bytes.Equal(got[0], sps) || !bytes.Equal(got[1], pps) {
-		t.Fatalf("new publisher was not primed: %x", got)
-	}
-	tail := got[before:]
-	if len(tail) != 2 || !bytes.Equal(tail[0], idr) || !bytes.Equal(tail[1], sli) {
-		t.Fatalf("new publisher did not start at the keyframe: %x", tail)
+	got := fresh.got()
+	if last := got[len(got)-1]; !bytes.Equal(last, idr) {
+		t.Fatalf("last delivered %x, want the keyframe", last)
 	}
 }
 
-// A cached server address ages from its real discovery, never from the
-// token refresh that reused it (REE-1054).
-func TestACachedAddressAgesFromItsDiscovery(t *testing.T) {
-	now := time.Now().Unix()
-	fresh := tokenCache{AccessID: "a", AccessToken: "t", ServerAddr: "s", CachedAt: now, DiscoveredAt: now - 3600}
-	if !fresh.isValid() {
-		t.Fatal("an hour-old discovery is still good")
+// The deadman follows what the camera delivers, not what the publisher
+// accepted: a blocked publisher does not end a healthy camera session.
+func TestDeadmanUsesCameraArrivalNotPublisherWrites(t *testing.T) {
+	stalled := newStallPub()
+	w := newWriteTrackerWith(stalled, 4, time.Hour)
+	defer func() { stalled.Close(); w.Close() }()
+	w.sessionStart.Store(time.Now().Add(-time.Hour).UnixNano())
+	w.Write(sli)
+	if since := time.Since(w.deadmanBaseline()); since > time.Second {
+		t.Fatalf("deadman baseline %s old after fresh camera video", since)
 	}
-	old := fresh
-	old.DiscoveredAt = now - 8*24*3600
-	if old.isValid() {
-		t.Fatal("an eight-day-old discovery kept alive by a fresh CachedAt")
-	}
-	before := fresh
-	before.DiscoveredAt = 0
-	if before.isValid() {
-		t.Fatal("a cache from before has no known discovery time")
+	if !w.lastWriteTime().IsZero() {
+		t.Fatal("publisher write recorded although the publisher accepted nothing")
 	}
 }

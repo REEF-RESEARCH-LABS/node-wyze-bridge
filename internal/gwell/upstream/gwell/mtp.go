@@ -154,6 +154,32 @@ func BuildKCPAckSegment(conv uint32, sn uint32, ts uint32, una uint32) []byte {
 	return seg
 }
 
+// Unverified wire divergences (REE-1054 native-session comparison §2-§4).
+// The inspected app differs from this bridge on each of these; none is
+// proven to matter for the Window Cam and none has been replayed against
+// a real camera. They keep the bridge's existing values on purpose, so
+// the bytes on the wire are unchanged. Flip one only after a verified,
+// authorized Window exchange shows it is needed.
+const (
+	// AVCtlCommonFlags goes at inner-frame offset 0x40 of INITREQ. The
+	// native common builder was observed writing 9 (bits 0 and 3); the
+	// bridge sends 0.
+	AVCtlCommonFlags uint16 = 0
+	// AVCtlStampInitReqTime writes current Unix seconds at offset 0x44 of
+	// INITREQ, as the native action-1 builder was observed doing. The
+	// bridge leaves it 0.
+	AVCtlStampInitReqTime = false
+	// initReqRenewInterval: the bridge re-sends INITREQ on an established
+	// stream as a keepalive. The app's setup path sends a bounded INITREQ
+	// burst instead; a periodic renewal is not established app behavior.
+	initReqRenewInterval = 15 * time.Second
+	// serverHeartbeatInterval: fixed. The app picks 35/40/50 s from the
+	// heartbeat response; that selection is not implemented here.
+	serverHeartbeatInterval = 40 * time.Second
+	// No 0xC4 keep-live is sent. The app's 60 s 0xC4 sender's callers and
+	// Window applicability were not recovered; do not add one by analogy.
+)
+
 // BuildAVStreamCtlINITREQ builds a 76-byte AVSTREAMCTL INITREQ (cmd=1).
 func BuildAVStreamCtlINITREQ(sessionID uint32, connType uint32, callAction uint32, channelField uint16, avKey []byte) []byte {
 	buf := make([]byte, 76)
@@ -169,6 +195,12 @@ func BuildAVStreamCtlINITREQ(sessionID uint32, connType uint32, callAction uint3
 		copy(buf[24:56], avKey[:32])
 	}
 	binary.LittleEndian.PutUint16(buf[62:64], channelField)
+	if AVCtlCommonFlags != 0 {
+		binary.LittleEndian.PutUint16(buf[0x40:0x42], AVCtlCommonFlags)
+	}
+	if AVCtlStampInitReqTime {
+		binary.LittleEndian.PutUint32(buf[0x44:0x48], uint32(time.Now().Unix()))
+	}
 	return buf
 }
 

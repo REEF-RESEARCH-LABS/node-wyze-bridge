@@ -165,6 +165,23 @@ type Session struct {
 	meterReqCount int       // incoming meter REQUESTs from camera (since last log)
 	meterAckCount int       // incoming meter ACKs from camera (since last log)
 
+	// Route trial (lifecycle.go). routeMu guards bestLanAddr, lanMTPAddrs
+	// appends and the fields below: the KCP update goroutine reads them.
+	routeMu       sync.Mutex
+	lanVerified   bool      // the camera answered from a LAN address
+	lanAbandoned  bool      // LAN trial ran out; relay only
+	lastLanRecv   time.Time // last packet from the locked LAN address
+	lanTrialStart time.Time
+
+	// Lifecycle reporting (lifecycle.go)
+	stage         atomic.Value // string
+	lastControl   atomic.Value // string
+	lateAccepts   atomic.Int32
+	terminal      *TerminalControlError
+	terminalAt    time.Time
+	terminalBytes int
+	firstVideo    bool
+
 	// Lifecycle
 	state  SessionState
 	closed int32
@@ -249,8 +266,10 @@ func (s *Session) nextSqnum() uint32 {
 // Run executes the full P2P session lifecycle. Blocks until session ends or error.
 func (s *Session) Run(deviceID string) error {
 	defer s.Close()
+	defer s.setStage(StageEnded)
 
 	// Phase 1: Connect to P2P server
+	s.setStage(StageRegistering)
 	if err := s.connect(); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -272,6 +291,7 @@ func (s *Session) Run(deviceID string) error {
 	}
 
 	// Phase 4: Network detect probe
+	s.setStage(StageSubscribing)
 	s.networkDetect()
 
 	// Phase 5: Subscribe
@@ -283,6 +303,7 @@ func (s *Session) Run(deviceID string) error {
 	}
 
 	// Phase 7: MTP transport + KCP stream
+	s.setStage(StageNegotiating)
 	return s.streamLoop()
 }
 
@@ -689,7 +710,9 @@ func (s *Session) calling() error {
 				if p != 0 && !seen[p] {
 					seen[p] = true
 					addr := &net.UDPAddr{IP: lanIP, Port: int(p)}
+					s.routeMu.Lock()
 					s.lanMTPAddrs = append(s.lanMTPAddrs, addr)
+					s.routeMu.Unlock()
 				}
 			}
 			addPort(peerSessionPort)
@@ -1072,6 +1095,8 @@ func isCameraLanIP(ip net.IP) bool {
 
 // addLanMTPAddr adds a new LAN MTP address if not already tracked.
 // Only private/LAN IPs are accepted — public relay server IPs are filtered out.
+// Every caller passes the source of a packet the camera actually sent, so
+// this also marks the LAN route as answered (verified).
 func (s *Session) addLanMTPAddr(addr *net.UDPAddr) {
 	if addr == nil {
 		return
@@ -1079,6 +1104,9 @@ func (s *Session) addLanMTPAddr(addr *net.UDPAddr) {
 	if !isCameraLanIP(addr.IP) {
 		return
 	}
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	s.lanVerified = true
 	for _, a := range s.lanMTPAddrs {
 		if a.IP.Equal(addr.IP) && a.Port == addr.Port {
 			return
@@ -1113,9 +1141,14 @@ func (s *Session) setupTransport(callingRelayIP net.IP, callingRelayPort uint16,
 		}
 	}
 
-	// Prefer LAN direct when camera is reachable on LAN.
+	// Prefer LAN direct when the camera has answered on LAN.
 	// TCP relay goes through Wyze's servers and has session timeouts (~2-3 min).
-	if len(s.lanMTPAddrs) > 0 {
+	// LAN candidates the camera has not answered from are only a trial
+	// (REE-1054): they must not suppress a pending relay.
+	s.routeMu.Lock()
+	lanCount, lanVerified := len(s.lanMTPAddrs), s.lanVerified
+	s.routeMu.Unlock()
+	if lanCount > 0 && lanVerified {
 		// Close any pending TCP relay — we don't need it
 		select {
 		case c := <-tcpRelayChan:
@@ -1124,7 +1157,15 @@ func (s *Session) setupTransport(callingRelayIP net.IP, callingRelayPort uint16,
 			}
 		default:
 		}
-		log.Printf("%s using LAN direct (%d addrs) for MTP", s.prefix, len(s.lanMTPAddrs))
+		log.Printf("%s using LAN direct (%d addrs) for MTP", s.prefix, lanCount)
+	} else if lanCount > 0 {
+		select {
+		case c := <-tcpRelayChan:
+			s.tcpRelay = c
+		case <-time.After(5 * time.Second):
+		}
+		log.Printf("%s LAN candidates unanswered (%d addrs): trying LAN for up to %s with the relay kept (tcp relay: %v, udp relays: %d)",
+			s.prefix, lanCount, lanTrialTimeout, s.tcpRelay != nil, len(s.udpRelayTargets))
 	} else {
 		// No LAN addresses — wait for TCP relay as fallback
 		select {
@@ -1143,21 +1184,17 @@ func (s *Session) setupTransport(callingRelayIP net.IP, callingRelayPort uint16,
 // sendMTP sends an MTP frame to the camera via the best available path.
 // Like kcpOutputFn, prefers LAN direct and avoids flooding the P2P server.
 func (s *Session) sendMTP(data []byte) {
-	// If we have a confirmed best LAN address, use only that
-	if s.bestLanAddr != nil {
-		s.pc.WriteToUDP(data, s.bestLanAddr)
+	// A confirmed best LAN address alone; otherwise every LAN candidate,
+	// and the relay paths too while no LAN address has answered.
+	lan, relay := s.routeTargets()
+	for _, addr := range lan {
+		s.pc.WriteToUDP(data, addr)
+	}
+	if !relay {
 		return
 	}
 
-	// Send to all known camera LAN addresses (during initial setup/probing)
-	if len(s.lanMTPAddrs) > 0 {
-		for _, addr := range s.lanMTPAddrs {
-			s.pc.WriteToUDP(data, addr)
-		}
-		return
-	}
-
-	// Fallback: no LAN addresses, use relay paths
+	// Relay paths
 	if s.tcpRelay != nil {
 		tcpData := make([]byte, len(data))
 		copy(tcpData, data)
@@ -1195,6 +1232,11 @@ func (s *Session) streamLoop() error {
 	pc := s.pc
 	buf := make([]byte, 8192)
 
+	// The LAN trial clock starts with media setup.
+	s.routeMu.Lock()
+	s.lanTrialStart = time.Now()
+	s.routeMu.Unlock()
+
 	// Send heartbeat
 	hb := BuildHeartbeat(token, s.routingSessionID, s.nextSqnum(), result.SessionKey, s.pwdKey)
 	pc.WriteToUDP(hb, s.serverUDPAddr)
@@ -1222,21 +1264,17 @@ func (s *Session) streamLoop() error {
 		payload := data[:size]
 		stdFrame := BuildMTPFrame(payload, false)
 
-		// If we have a confirmed best LAN address (from received data), use only that
-		if s.bestLanAddr != nil {
-			s.pc.WriteToUDP(stdFrame, s.bestLanAddr)
+		// A confirmed best LAN address (from received data) alone; otherwise
+		// every LAN candidate, plus the relay paths while none has answered.
+		lan, relay := s.routeTargets()
+		for _, addr := range lan {
+			s.pc.WriteToUDP(stdFrame, addr)
+		}
+		if !relay {
 			return
 		}
 
-		// Otherwise send to all known camera LAN addresses (during initial probing)
-		if len(s.lanMTPAddrs) > 0 {
-			for _, addr := range s.lanMTPAddrs {
-				s.pc.WriteToUDP(stdFrame, addr)
-			}
-			return
-		}
-
-		// Fallback: no LAN addresses available, use relay paths
+		// Relay paths
 		for _, rt := range s.udpRelayTargets {
 			extFrame := BuildExtendedMTPFrame(payload, s.targetDev.TID, false)
 			s.pc.WriteToUDP(extFrame, rt.Addr)
@@ -1364,12 +1402,8 @@ func (s *Session) streamLoop() error {
 						newAddr := &net.UDPAddr{IP: append(net.IP(nil), fromAddr.IP...), Port: fromAddr.Port}
 						s.discoveredRelays.LoadOrStore(addrKey, newAddr)
 					} else {
-						s.addLanMTPAddr(fromAddr)
 						// Lock best LAN addr during INITREQ phase too
-						if isCameraLanIP(fromAddr.IP) && s.bestLanAddr == nil {
-							s.bestLanAddr = &net.UDPAddr{IP: append(net.IP(nil), fromAddr.IP...), Port: fromAddr.Port}
-							log.Printf("%s locked bestLanAddr: %s", s.prefix, s.bestLanAddr)
-						}
+						s.noteLanReturn(fromAddr)
 					}
 				}
 
@@ -1503,6 +1537,7 @@ func (s *Session) streamLoop() error {
 
 	// Main stream loop
 	s.state = StateStreaming
+	s.setStage(StageWaitingFirstVideo)
 	log.Printf("%s streaming started", s.prefix)
 
 	lastHeartbeat := time.Now()
@@ -1512,14 +1547,29 @@ func (s *Session) streamLoop() error {
 	lastStreamRenew := time.Now()
 
 	for !s.isClosed() {
-		// AVSTREAM session renewal every 15 seconds.
+		// Terminal control message on the established stream (REE-1054):
+		// end this generation cleanly; the caller renegotiates with backoff.
+		// The deferred kcpDone close and Run's Close release the KCP timers,
+		// sockets and relay connection.
+		now := time.Now()
+		if err := s.checkTerminal(now); err != nil {
+			log.Printf("%s %v", s.prefix, err)
+			s.state = StateClosed
+			return err
+		}
+		s.checkRoute(now)
+
+		// AVSTREAM session renewal every 15 seconds (initReqRenewInterval).
+		// Unverified divergence (REE-1054 comparison §2): the inspected app
+		// sends a bounded INITREQ burst at setup, not a periodic renewal.
+		// Kept as-is until a verified Window exchange says otherwise.
 		// The Wyze doorbell firmware (battery-design lineage) has a ~20-25s
 		// live-view session window. Without periodic INITREQ renewals on the
 		// CTRL KCP the camera silently stops sending video after ~22s while
 		// the P2P relay stays up (meter probes keep the relay alive, but the
 		// camera's AV layer times out separately). Re-sending INITREQ tells
 		// the camera a viewer is still active and resets its session timer.
-		if time.Since(lastStreamRenew) > 15*time.Second {
+		if time.Since(lastStreamRenew) > initReqRenewInterval {
 			renewPayload := BuildAVStreamCtlINITREQ(streamID, 1, 1, 0, avKey)
 			s.ctrlKCP.Send(renewPayload)
 			s.ctrlKCP.Flush()
@@ -1527,8 +1577,9 @@ func (s *Session) streamLoop() error {
 			lastStreamRenew = time.Now()
 		}
 
-		// Heartbeat every 40 seconds (SDK uses 35-50s)
-		if time.Since(lastHeartbeat) > 40*time.Second {
+		// Heartbeat every 40 seconds (SDK uses 35-50s). Fixed interval kept
+		// (serverHeartbeatInterval); response-driven selection is unverified.
+		if time.Since(lastHeartbeat) > serverHeartbeatInterval {
 			hb := BuildHeartbeat(token, s.routingSessionID, s.nextSqnum(), result.SessionKey, s.pwdKey)
 			pc.WriteToUDP(hb, s.serverUDPAddr)
 			lastHeartbeat = time.Now()
@@ -1597,7 +1648,7 @@ func (s *Session) streamLoop() error {
 				meterAge = fmt.Sprintf("%.1fs ago", time.Since(s.lastMeterRecv).Seconds())
 			}
 			log.Printf("%s  meter: sent=%d recvREQ=%d recvACK=%d lastRecv=%s | bestLAN: %v",
-				s.prefix, s.meterRound, s.meterReqCount, s.meterAckCount, meterAge, s.bestLanAddr)
+				s.prefix, s.meterRound, s.meterReqCount, s.meterAckCount, meterAge, s.bestLan())
 			s.meterReqCount = 0
 			s.meterAckCount = 0
 			lastStatus = time.Now()
@@ -1661,13 +1712,9 @@ func (s *Session) streamLoop() error {
 					newAddr := &net.UDPAddr{IP: append(net.IP(nil), fromAddr.IP...), Port: fromAddr.Port}
 					s.discoveredRelays.LoadOrStore(addrKey, newAddr)
 				} else {
-					s.addLanMTPAddr(fromAddr)
 					// Lock onto the LAN address that's actually sending us data
-					// SDK equivalent: mtpSession+0x5c (best addr from meter probing)
-					if isCameraLanIP(fromAddr.IP) && s.bestLanAddr == nil {
-						s.bestLanAddr = &net.UDPAddr{IP: append(net.IP(nil), fromAddr.IP...), Port: fromAddr.Port}
-						log.Printf("%s locked bestLanAddr: %s", s.prefix, s.bestLanAddr)
-					}
+					// (return traffic), and keep its liveness fresh.
+					s.noteLanReturn(fromAddr)
 				}
 			}
 
@@ -1699,21 +1746,12 @@ func (s *Session) streamLoop() error {
 						mPayOff += int(msLen)
 					}
 				}
-				off := mPayOff
-				for off+24 <= n {
-					kcpCmd := buf[off+4]
-					if kcpCmd == 81 {
-						kcpConv := binary.LittleEndian.Uint32(buf[off : off+4])
-						kcpSN2 := binary.LittleEndian.Uint32(buf[off+12 : off+16])
-						kcpTS := binary.LittleEndian.Uint32(buf[off+8 : off+12])
-						ackSeg := BuildKCPAckSegment(kcpConv, kcpSN2, kcpTS, s.dataKCP.RcvNxt())
-						ackMTP := BuildMTPFrame(ackSeg, false)
-						if fromAddr != nil {
-							pc.WriteToUDP(ackMTP, fromAddr)
-						}
+				// Each ACK carries the una of its own conversation
+				// (DirectAcks); the data una was used for control too.
+				if mPayOff < n && fromAddr != nil {
+					for _, ackSeg := range DirectAcks(buf[mPayOff:n], s.convData, s.convCtrl, s.dataKCP.RcvNxt(), s.ctrlKCP.RcvNxt()) {
+						pc.WriteToUDP(BuildMTPFrame(ackSeg, false), fromAddr)
 					}
-					segLen := binary.LittleEndian.Uint32(buf[off+20 : off+24])
-					off += 24 + int(segLen)
 				}
 			}
 
@@ -1773,7 +1811,7 @@ func (s *Session) streamLoop() error {
 	log.Printf("%s  CTRL-KCP: rcvNxt=%d rcvQ=%d rcvBuf=%d sndUna=%d sndNxt=%d waitSnd=%d rmtWnd=%d cwnd=%d rexmit=%d dropOld=%d dropAhead=%d",
 		s.prefix, cs.RcvNxt, cs.RcvQueueLen, cs.RcvBufLen, cs.SndUna, cs.SndNxt, cs.SndBufLen+cs.SndQueueLen, cs.RmtWnd, cs.CWnd, cs.Retransmits, cs.SNDropOld, cs.SNDropAhead)
 	log.Printf("%s  meter: sent=%d lastRecv=%s | bestLAN: %v | lastDataFrom: %s",
-		s.prefix, s.meterRound, meterAge, s.bestLanAddr, s.lastDataFrom)
+		s.prefix, s.meterRound, meterAge, s.bestLan(), s.lastDataFrom)
 	return nil
 }
 
@@ -1788,6 +1826,15 @@ func (s *Session) drainKCPRecv() {
 		s.streamDataBytes += len(data)
 		if len(data) > 0 {
 			h264 := DecryptMTPPayload(data, s.mtpRC5Ctx, "DATA")
+			if h264 != nil && !s.firstVideo {
+				s.firstVideo = true
+				if s.terminal == nil {
+					s.setStage(StageForwarding)
+				}
+			}
+			// The writer must not block (cmd/gwell-proxy queues and
+			// drops to the next keyframe): this goroutine also runs the
+			// heartbeats, meter probes and stop checks.
 			if h264 != nil && s.cfg.H264Writer != nil {
 				s.cfg.H264Writer.Write(h264)
 			}
@@ -1827,6 +1874,7 @@ func (s *Session) drainKCPRecv() {
 				}
 				log.Printf("%s AVSTREAMCTL on CTRL: action=%s(%d) reason=%d len=%d hex=%x",
 					s.prefix, avActionName, avAction, reason, len(data), data[:minInt(len(data), 40)])
+				s.noteControl(avAction, reason)
 			}
 			DecryptMTPPayload(data, s.mtpRC5Ctx, "CTRL")
 		}

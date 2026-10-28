@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -290,6 +291,12 @@ func Load() (*Config, error) {
 }
 
 // CamQuality returns the effective quality for a camera.
+// GwellStatusFile is where gwell-proxy writes its per-camera lifecycle
+// status; the bridge serves it on /api/cameras as "gwell".
+func (c *Config) GwellStatusFile() string {
+	return filepath.Join(c.StateDir, "gwell", "status.json")
+}
+
 func (c *Config) CamQuality(camName string) string {
 	key := normalizeCamName(camName)
 	if ov, ok := c.CamOverrides[key]; ok && ov.Quality != nil {

@@ -33,6 +33,17 @@
 >   discovery, and two sessions in a row with no video look it up afresh.
 > - TUTK to WebRTC auto-fallback is off by default (`TUTK_FALLBACK_THRESHOLD=0`):
 >   on-demand streams counted their own stops as failures.
+> - Window Cam session survives (4.6.1-node.18). gwell-proxy's video
+>   output can no longer block the camera session's heartbeats or the
+>   monitor: a bounded queue, a 5 s write deadline, and drop to the next
+>   keyframe when ffmpeg falls behind. The P2P endpoint ages from real
+>   discovery (24 h) and is rediscovered after 3 failed attempts; token
+>   refreshes no longer keep a stale one alive. REJECT/STOP/CLOSE after
+>   video starts ends that session generation and reconnects. Unanswered
+>   LAN addresses no longer shut out the relay. Retries: 3 s, 10 s, 30 s,
+>   then a 2 to 15 minute cooldown and one try, never a permanent stop; a
+>   credential Wyze refuses is held 15 minutes. `/api/cameras` adds
+>   `gwell` (stage, generation, last_error, last_video_at, next_retry_at).
 > - `home_assistant/node_one_wyze_bridge`: a local add-on build of the above.
 
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/idisposable/docker-wyze-bridge?logo=github)](https://github.com/idisposable/docker-wyze-bridge/releases/latest)

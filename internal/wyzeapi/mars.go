@@ -135,7 +135,7 @@ func (c *Client) MarsRegisterGWUser(ctx context.Context, deviceID string) (acces
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", "", fmt.Errorf("mars: %d %s: %s", resp.StatusCode, resp.Status, string(raw))
+		return "", "", &MarsHTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(raw)}
 	}
 
 	var env marsEnvelope
@@ -159,6 +159,24 @@ func (c *Client) MarsRegisterGWUser(ctx context.Context, deviceID string) (acces
 		Msg("minted gwell credential via mars")
 
 	return env.Data.AccessID, env.Data.AccessToken, nil
+}
+
+// MarsHTTPError is a non-2xx answer from the Mars endpoint. A 401 or 403
+// is Wyze refusing the credential; the shim passes that on to gwell-proxy
+// as 403 so it holds instead of retrying (REE-1054).
+type MarsHTTPError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *MarsHTTPError) Error() string {
+	return fmt.Sprintf("mars: %d %s: %s", e.StatusCode, e.Status, e.Body)
+}
+
+// Refused reports a credential refusal (HTTP 401/403).
+func (e *MarsHTTPError) Refused() bool {
+	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
 }
 
 // marsSignBody implements the Wpk "dynamic signature" HMAC.

@@ -75,7 +75,7 @@ func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger
 	const maxBackoff = 60 * time.Second
 
 	for ctx.Err() == nil {
-		if err := runGwellProxyOnce(ctx, bin, shimURL, rtspHost, rtspPort, dumpDir, ffmpegLogLevel, deadmanTimeout, log); err != nil {
+		if err := runGwellProxyOnce(ctx, bin, shimURL, rtspHost, rtspPort, dumpDir, ffmpegLogLevel, deadmanTimeout, cfg.GwellStatusFile(), log); err != nil {
 			log.Warn().Err(err).Dur("backoff", backoff).Msg("gwell-proxy exited; restarting")
 		}
 		if ctx.Err() != nil {
@@ -97,7 +97,7 @@ func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger
 // the parent context cancels. Stdout/stderr are routed through the
 // caller's zerolog logger so the subprocess noise blends into the
 // bridge's structured log output.
-func runGwellProxyOnce(ctx context.Context, bin, shimURL, rtspHost string, rtspPort int, dumpDir, ffmpegLogLevel string, deadmanTimeout time.Duration, log zerolog.Logger) error {
+func runGwellProxyOnce(ctx context.Context, bin, shimURL, rtspHost string, rtspPort int, dumpDir, ffmpegLogLevel string, deadmanTimeout time.Duration, statusFile string, log zerolog.Logger) error {
 	args := []string{
 		"--shim-url", shimURL,
 		"--rtsp-host", rtspHost,
@@ -111,6 +111,9 @@ func runGwellProxyOnce(ctx context.Context, bin, shimURL, rtspHost string, rtspP
 	}
 	if deadmanTimeout > 0 {
 		args = append(args, "--deadman-timeout", deadmanTimeout.String())
+	}
+	if statusFile != "" {
+		args = append(args, "--status-file", statusFile)
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	stdout, err := cmd.StdoutPipe()

@@ -13,6 +13,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -88,8 +89,27 @@ func (c *wyzeShimClient) getJSON(path string, out interface{}) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("shim GET %s: %d %s", path, resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return &shimStatusError{Path: path, Code: resp.StatusCode, Body: string(body)}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// shimStatusError is a non-2xx answer from the bridge's shim.
+type shimStatusError struct {
+	Path string
+	Code int
+	Body string
+}
+
+func (e *shimStatusError) Error() string {
+	return fmt.Sprintf("shim GET %s: %d %s", e.Path, e.Code, e.Body)
+}
+
+// isCredentialRefused reports the bridge's answer that Wyze refused the
+// camera credential (the shim maps a Mars 401/403 to 403). Other failures
+// (502 network/cloud errors, 503 not wired yet) are transient.
+func isCredentialRefused(err error) bool {
+	var se *shimStatusError
+	return errors.As(err, &se) && (se.Code == http.StatusUnauthorized || se.Code == http.StatusForbidden)
 }

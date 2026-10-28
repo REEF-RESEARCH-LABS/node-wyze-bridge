@@ -114,6 +114,21 @@ declaration, not across module paths.
    When rebasing, re-apply the reordering: try `TryDecrypt` first, skip
    if `nil`, then log the raw header and decrypted fields.
 
+8. **Node One session lifecycle (4.6.1-node.17, REE-1054).** Original
+   Node code in `gwell/lifecycle.go` (not upstream material), wired into
+   `gwell/session.go`: typed stages (`Session.Stage`); REJECT/STOP/CLOSE
+   after first video end the generation (`TerminalControlError`) unless
+   video keeps arriving for 3 s; LAN candidates the camera has not
+   answered from no longer suppress the relay, the LAN trial is bounded,
+   and a silent learned LAN route is unlocked; supplementary direct KCP
+   ACKs carry the una of their own conversation (`DirectAcks`; the data
+   una was sent for control segments too). `gwell/mtp.go` names the
+   unverified wire divergences (`AVCtlCommonFlags`,
+   `AVCtlStampInitReqTime`, INITREQ renewal and heartbeat intervals) at
+   their existing values: the bytes on the wire are unchanged.
+   When rebasing, re-apply the `lifecycle.go` calls in `Run`, `setupTransport`,
+   `sendMTP`, the KCP output function, both receive loops and `drainKCPRecv`.
+
 ## Updating
 
 When upstream cuts a new commit:

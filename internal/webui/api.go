@@ -54,8 +54,9 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAPICameras(w http.ResponseWriter, r *http.Request) {
 	cameras := s.camMgr.Cameras()
 	result := make([]map[string]interface{}, 0, len(cameras))
+	gwell := s.gwellStatuses()
 	for _, cam := range cameras {
-		result = append(result, cam.StatusJSON())
+		result = append(result, withGwellStatus(cam.StatusJSON(), gwell))
 	}
 	writeJSON(w, result)
 }
@@ -133,7 +134,7 @@ func (s *Server) handleAPICameraAction(w http.ResponseWriter, r *http.Request) {
 
 	if len(parts) == 1 || parts[1] == "" {
 		// GET /api/cameras/{name}
-		writeJSON(w, cam.StatusJSON())
+		writeJSON(w, withGwellStatus(cam.StatusJSON(), s.gwellStatuses()))
 		return
 	}
 

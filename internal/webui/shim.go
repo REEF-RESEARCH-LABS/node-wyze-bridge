@@ -2,6 +2,7 @@ package webui
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -127,7 +128,14 @@ func (s *Server) handleShimCameraToken(w http.ResponseWriter, r *http.Request) {
 	accessID, accessToken, err := s.mars.MarsRegisterGWUser(r.Context(), id)
 	if err != nil {
 		s.log.Warn().Err(err).Str("cam", id).Msg("mars token mint failed")
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		// A credential Wyze refused is 403, so gwell-proxy holds instead
+		// of retrying; anything else stays 502 (transient).
+		code := http.StatusBadGateway
+		var refused interface{ Refused() bool }
+		if errors.As(err, &refused) && refused.Refused() {
+			code = http.StatusForbidden
+		}
+		http.Error(w, err.Error(), code)
 		return
 	}
 	writeJSON(w, map[string]string{
